@@ -193,6 +193,103 @@ def test_no_prompt_when_site_verifies_clean(fake_dirs, fake_nginx_ok, monkeypatc
     assert prompts == []  # input() was never called
 
 
+# --- validation functions (new in v0.3) ---
+
+@pytest.mark.parametrize("name,expected", [
+    ("messiah", True),
+    ("st-marks", True),
+    ("st_marks2", True),
+    ("StMarks", True),
+    ("", False),
+    ("-messiah", False),          # can't start with a hyphen
+    ("messiah/etc", False),       # no slashes
+    ("messiah.example", False),   # no dots in a site name
+    ("messiah site", False),      # no spaces
+    ("a" * 64, False),            # too long
+])
+def test_is_valid_site_name(name, expected):
+    assert site_build.is_valid_site_name(name) == expected
+
+
+@pytest.mark.parametrize("domain,expected", [
+    ("messiah.example.org", True),
+    ("messiah", True),                # bare label, allowed for local testing
+    ("st-marks.example.org", True),
+    ("", False),
+    ("-messiah.example.org", False),  # can't start with a hyphen
+    ("messiah..org", False),          # empty label
+    ("messiah example.org", False),   # no spaces
+    ("messiah.example.org/", False),  # no slashes
+])
+def test_is_valid_domain(domain, expected):
+    assert site_build.is_valid_domain(domain) == expected
+
+
+def test_find_domain_conflict_detects_existing(fake_dirs):
+    (fake_dirs["sites_available"] / "stmarks").write_text(
+        "server {\n    server_name stmarks.example.org;\n}\n"
+    )
+    conflict = site_build.find_domain_conflict("stmarks.example.org")
+    assert conflict == "stmarks"
+
+
+def test_find_domain_conflict_none_when_free(fake_dirs):
+    conflict = site_build.find_domain_conflict("unused.example.org")
+    assert conflict is None
+
+
+def test_preflight_all_pass_on_clean_setup(fake_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: "/usr/sbin/nginx")
+    monkeypatch.setattr(site_build, "nginx_is_running", lambda: True)
+
+    checks = site_build.run_preflight_checks("messiah", "messiah.example.org")
+
+    assert all(ok for _label, ok, _detail in checks)
+
+
+def test_preflight_catches_invalid_name(fake_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: "/usr/sbin/nginx")
+    monkeypatch.setattr(site_build, "nginx_is_running", lambda: True)
+
+    checks = site_build.run_preflight_checks("-bad-name", "messiah.example.org")
+
+    results = {label: ok for label, ok, _detail in checks}
+    assert results["Valid site name"] is False
+
+
+def test_preflight_catches_nginx_not_running(fake_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: "/usr/sbin/nginx")
+    monkeypatch.setattr(site_build, "nginx_is_running", lambda: False)
+
+    checks = site_build.run_preflight_checks("messiah", "messiah.example.org")
+
+    results = {label: ok for label, ok, _detail in checks}
+    assert results["nginx running"] is False
+
+
+def test_preflight_catches_domain_conflict(fake_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: "/usr/sbin/nginx")
+    monkeypatch.setattr(site_build, "nginx_is_running", lambda: True)
+    (fake_dirs["sites_available"] / "otherparish").write_text(
+        "server {\n    server_name messiah.example.org;\n}\n"
+    )
+
+    checks = site_build.run_preflight_checks("messiah", "messiah.example.org")
+
+    results = {label: ok for label, ok, _detail in checks}
+    assert results["Domain not already in use"] is False
+
+
+def test_main_stops_before_any_changes_on_preflight_failure(fake_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: None)  # nginx "not installed"
+
+    exit_code = site_build.main(["messiah", "--domain", "messiah.example.org"])
+
+    assert exit_code != 0
+    assert not (fake_dirs["web_root"] / "messiah").exists()
+    assert not (fake_dirs["sites_available"] / "messiah").exists()
+
+
 # --- main() end-to-end ---
 
 def test_main_creates_dir_and_nginx_site(fake_dirs, fake_nginx_ok):

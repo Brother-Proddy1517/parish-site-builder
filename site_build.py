@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """
 Parish Site Builder
-v0.2 — create a web root directory AND a working nginx site.
+v0.3 — pre-flight validation, then create a web root directory AND a
+working nginx site.
+
+Before touching anything, checks: valid site name, valid domain, nginx
+installed and running, no existing web dir or config, and that the domain
+isn't already claimed by a different site. If anything fails, nothing is
+created or changed.
 
 Usage:
     site_build.py <name> [--domain DOMAIN]
 
 Example:
     site_build.py messiah --domain messiah.example.org
+        -> validates everything first
         -> creates /srv/www/messiah
         -> writes /etc/nginx/sites-available/messiah
         -> symlinks it into /etc/nginx/sites-enabled/messiah
         -> tests nginx config, reloads nginx if valid
+        -> verifies the site is actually reachable
 
     site_build.py messiah
         -> same, but domain defaults to "messiah"
@@ -19,6 +27,7 @@ Example:
 
 import argparse
 import http.client
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +41,17 @@ NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
 # we expected the site we just created, nginx is still routing the request
 # to the default site instead of the new one.
 DEFAULT_NGINX_MARKER = "Welcome to nginx!"
+
+# Site name: safe as both a directory name and an nginx config filename.
+SITE_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$")
+
+# Domain / hostname: standard DNS label rules, dot-separated. Also accepts a
+# single bare label (e.g. "messiah") since that's what --domain defaults to
+# for local/VM testing without a real DNS name.
+DOMAIN_PATTERN = re.compile(
+    r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+    r"(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$"
+)
 
 NGINX_TEMPLATE = """server {{
     listen 80;
@@ -74,6 +94,140 @@ def build_parser() -> argparse.ArgumentParser:
              "Defaults to the site name if omitted.",
     )
     return parser
+
+
+def is_valid_site_name(name: str) -> bool:
+    return bool(SITE_NAME_PATTERN.match(name))
+
+
+def is_valid_domain(domain: str) -> bool:
+    return bool(DOMAIN_PATTERN.match(domain)) and len(domain) <= 253
+
+
+def nginx_is_running() -> bool:
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "nginx"], capture_output=True, text=True, check=False
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def find_domain_conflict(domain: str) -> str | None:
+    """
+    Scan existing nginx site configs for one that already claims this exact
+    domain as a server_name. Returns the conflicting site's filename, or
+    None if the domain is free.
+
+    This catches the case our other checks miss: two different site *names*
+    (e.g. "messiah" and "messiah2") both trying to claim the same domain.
+    """
+    if not NGINX_SITES_AVAILABLE.exists():
+        return None
+
+    server_name_re = re.compile(r"server_name\s+([^;]+);")
+
+    for config_file in NGINX_SITES_AVAILABLE.iterdir():
+        if not config_file.is_file():
+            continue
+        try:
+            text = config_file.read_text()
+        except OSError:
+            continue
+        for match in server_name_re.finditer(text):
+            names = match.group(1).split()
+            if domain in names:
+                return config_file.name
+    return None
+
+
+def run_preflight_checks(name: str, domain: str) -> list[tuple[str, bool, str]]:
+    """
+    Run every check before anything is created or changed.
+
+    Returns a list of (label, passed, detail) tuples. `detail` is a
+    human-readable reason, only meaningful when passed is False.
+    """
+    checks = []
+
+    checks.append((
+        "Valid site name",
+        is_valid_site_name(name),
+        f"'{name}' must start with a letter/number and contain only letters, "
+        "numbers, hyphens, and underscores (max 63 characters).",
+    ))
+
+    checks.append((
+        "Valid domain",
+        is_valid_domain(domain),
+        f"'{domain}' doesn't look like a valid domain/hostname.",
+    ))
+
+    installed = nginx_installed()
+    checks.append((
+        "nginx installed",
+        installed,
+        "nginx is not installed on this system.",
+    ))
+
+    if installed:
+        running = nginx_is_running()
+        checks.append((
+            "nginx running",
+            running,
+            "nginx is installed but not running (try: sudo systemctl start nginx).",
+        ))
+    else:
+        # Don't bother checking if it's running when it isn't even installed.
+        checks.append(("nginx running", False, "nginx is not installed."))
+
+    web_exists = (WEB_ROOT_BASE / name).exists()
+    checks.append((
+        "Web directory doesn't already exist",
+        not web_exists,
+        f"{WEB_ROOT_BASE / name} already exists.",
+    ))
+
+    config_exists = (NGINX_SITES_AVAILABLE / name).exists() or (NGINX_SITES_ENABLED / name).exists()
+    checks.append((
+        "No existing site configuration",
+        not config_exists,
+        f"An nginx config for '{name}' already exists.",
+    ))
+
+    conflict = find_domain_conflict(domain)
+    checks.append((
+        "Domain not already in use",
+        conflict is None,
+        f"Domain '{domain}' is already used by site config '{conflict}'." if conflict else "",
+    ))
+
+    return checks
+
+
+def print_preflight_results(checks: list[tuple[str, bool, str]]) -> bool:
+    """Print the checklist, return True if every check passed."""
+    print("Checking...")
+    print()
+    all_ok = True
+    for label, ok, _detail in checks:
+        symbol = "\u2713" if ok else "\u2717"
+        print(f"{symbol} {label}")
+        if not ok:
+            all_ok = False
+
+    if not all_ok:
+        print()
+        print("ERROR")
+        print()
+        for label, ok, detail in checks:
+            if not ok:
+                print(detail)
+        print()
+        print("No changes were made.")
+
+    return all_ok
 
 
 def create_site_directory(name: str) -> int:
@@ -325,6 +479,14 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     domain = args.domain or args.name
+
+    checks = run_preflight_checks(args.name, domain)
+    if not print_preflight_results(checks):
+        return 1
+
+    print()
+    print("Creating site...")
+    print()
 
     rc = create_site_directory(args.name)
     if rc != 0:

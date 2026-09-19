@@ -92,7 +92,9 @@ def test_nginx_site_created_and_enabled(fake_dirs, fake_nginx_ok):
     symlink_path = fake_dirs["sites_enabled"] / "messiah"
     assert config_path.is_file()
     assert symlink_path.is_symlink()
-    assert "server_name messiah.example.org;" in config_path.read_text()
+    config_text = config_path.read_text()
+    assert "server_name messiah.example.org;" in config_text
+    assert "listen [::]:80;" in config_text  # IPv6 — catches the default-server fallthrough bug
 
 
 def test_nginx_not_installed(fake_dirs, monkeypatch):

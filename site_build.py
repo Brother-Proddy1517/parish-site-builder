@@ -29,6 +29,7 @@ NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
 
 NGINX_TEMPLATE = """server {{
     listen 80;
+    listen [::]:80;
     server_name {domain};
 
     root {web_root};

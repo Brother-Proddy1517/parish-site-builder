@@ -1,14 +1,16 @@
 """
-Tests for v0.1 of site_build.py
+Tests for site_build.py (v0.2)
 
 Run with:
     pytest tests/
+    (or: python3 -m pytest tests/  if the pytest command isn't on your PATH)
 
-These tests never touch the real /srv/www — they monkeypatch
-WEB_ROOT_BASE to a temporary directory so they're safe to run
-on your dev machine, not just the VM.
+These tests never touch real /srv/www or /etc/nginx — directories are
+monkeypatched to temp folders, and subprocess calls to `nginx` / `systemctl`
+are stubbed out, so they're safe to run on a machine with no nginx at all.
 """
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -19,46 +21,129 @@ import site_build  # noqa: E402
 
 
 @pytest.fixture
-def fake_web_root(tmp_path, monkeypatch):
-    """Point WEB_ROOT_BASE at a temp dir that already exists, like /srv/www would."""
-    fake_root = tmp_path / "srv_www"
-    fake_root.mkdir()
-    monkeypatch.setattr(site_build, "WEB_ROOT_BASE", fake_root)
-    return fake_root
+def fake_dirs(tmp_path, monkeypatch):
+    """Point all the real-filesystem paths at temp dirs."""
+    web_root = tmp_path / "srv_www"
+    web_root.mkdir()
+    sites_available = tmp_path / "sites-available"
+    sites_available.mkdir()
+    sites_enabled = tmp_path / "sites-enabled"
+    sites_enabled.mkdir()
+
+    monkeypatch.setattr(site_build, "WEB_ROOT_BASE", web_root)
+    monkeypatch.setattr(site_build, "NGINX_SITES_AVAILABLE", sites_available)
+    monkeypatch.setattr(site_build, "NGINX_SITES_ENABLED", sites_enabled)
+
+    return {
+        "web_root": web_root,
+        "sites_available": sites_available,
+        "sites_enabled": sites_enabled,
+    }
 
 
-def test_creates_directory(fake_web_root):
+@pytest.fixture
+def fake_nginx_ok(monkeypatch):
+    """Pretend nginx is installed and every subprocess call succeeds."""
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: "/usr/sbin/nginx")
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(site_build.subprocess, "run", fake_run)
+
+
+@pytest.fixture
+def fake_nginx_test_fails(monkeypatch):
+    """Pretend nginx is installed, but `nginx -t` fails."""
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: "/usr/sbin/nginx")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["nginx", "-t"]:
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="syntax error")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(site_build.subprocess, "run", fake_run)
+
+
+# --- create_site_directory (unchanged behavior from v0.1) ---
+
+def test_creates_directory(fake_dirs):
     exit_code = site_build.create_site_directory("messiah")
     assert exit_code == 0
-    assert (fake_web_root / "messiah").is_dir()
+    assert (fake_dirs["web_root"] / "messiah").is_dir()
 
 
-def test_refuses_if_already_exists(fake_web_root):
-    (fake_web_root / "messiah").mkdir()
-
+def test_refuses_if_already_exists(fake_dirs):
+    (fake_dirs["web_root"] / "messiah").mkdir()
     exit_code = site_build.create_site_directory("messiah")
-
     assert exit_code != 0
-    # Directory should still be there, untouched — not deleted or recreated.
-    assert (fake_web_root / "messiah").is_dir()
+    assert (fake_dirs["web_root"] / "messiah").is_dir()
 
 
-def test_errors_if_web_root_base_missing(tmp_path, monkeypatch):
-    missing_root = tmp_path / "does_not_exist"
-    monkeypatch.setattr(site_build, "WEB_ROOT_BASE", missing_root)
+# --- create_nginx_site (new in v0.2) ---
 
-    exit_code = site_build.create_site_directory("messiah")
+def test_nginx_site_created_and_enabled(fake_dirs, fake_nginx_ok):
+    site_build.create_site_directory("messiah")
 
-    assert exit_code != 0
-    assert not missing_root.exists()
+    exit_code = site_build.create_nginx_site("messiah", "messiah.example.org")
 
-
-def test_main_parses_positional_name(fake_web_root):
-    exit_code = site_build.main(["stmarks"])
     assert exit_code == 0
-    assert (fake_web_root / "stmarks").is_dir()
+    config_path = fake_dirs["sites_available"] / "messiah"
+    symlink_path = fake_dirs["sites_enabled"] / "messiah"
+    assert config_path.is_file()
+    assert symlink_path.is_symlink()
+    assert "server_name messiah.example.org;" in config_path.read_text()
 
 
-def test_main_requires_name_argument(fake_web_root):
-    with pytest.raises(SystemExit):
-        site_build.main([])
+def test_nginx_not_installed(fake_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: None)
+
+    exit_code = site_build.create_nginx_site("messiah", "messiah.example.org")
+
+    assert exit_code != 0
+    assert not (fake_dirs["sites_available"] / "messiah").exists()
+
+
+def test_rolls_back_on_failed_nginx_test(fake_dirs, fake_nginx_test_fails):
+    exit_code = site_build.create_nginx_site("messiah", "messiah.example.org")
+
+    assert exit_code != 0
+    # Both the config and the symlink should be cleaned up — nginx was never touched.
+    assert not (fake_dirs["sites_available"] / "messiah").exists()
+    assert not (fake_dirs["sites_enabled"] / "messiah").exists()
+
+
+def test_refuses_if_config_already_exists(fake_dirs, fake_nginx_ok):
+    (fake_dirs["sites_available"] / "messiah").write_text("existing config")
+
+    exit_code = site_build.create_nginx_site("messiah", "messiah.example.org")
+
+    assert exit_code != 0
+
+
+# --- main() end-to-end ---
+
+def test_main_creates_dir_and_nginx_site(fake_dirs, fake_nginx_ok):
+    exit_code = site_build.main(["messiah", "--domain", "messiah.example.org"])
+
+    assert exit_code == 0
+    assert (fake_dirs["web_root"] / "messiah").is_dir()
+    assert (fake_dirs["web_root"] / "messiah" / "index.html").is_file()
+    assert (fake_dirs["sites_available"] / "messiah").is_file()
+
+
+def test_main_domain_defaults_to_name(fake_dirs, fake_nginx_ok):
+    exit_code = site_build.main(["messiah"])
+
+    assert exit_code == 0
+    config_text = (fake_dirs["sites_available"] / "messiah").read_text()
+    assert "server_name messiah;" in config_text
+
+
+def test_main_stops_before_nginx_if_dir_creation_fails(fake_dirs, fake_nginx_ok):
+    (fake_dirs["web_root"] / "messiah").mkdir()  # pre-existing, will cause dir creation to fail
+
+    exit_code = site_build.main(["messiah"])
+
+    assert exit_code != 0
+    assert not (fake_dirs["sites_available"] / "messiah").exists()

@@ -43,13 +43,15 @@ def fake_dirs(tmp_path, monkeypatch):
 
 @pytest.fixture
 def fake_nginx_ok(monkeypatch):
-    """Pretend nginx is installed and every subprocess call succeeds."""
+    """Pretend nginx is installed, every subprocess call succeeds, and the
+    site verifies as reachable (no default-page fallthrough)."""
     monkeypatch.setattr(site_build.shutil, "which", lambda cmd: "/usr/sbin/nginx")
 
     def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, returncode=0, stdout="ok", stderr="")
 
     monkeypatch.setattr(site_build.subprocess, "run", fake_run)
+    monkeypatch.setattr(site_build, "verify_site_serving", lambda domain: [])
 
 
 @pytest.fixture
@@ -121,6 +123,74 @@ def test_refuses_if_config_already_exists(fake_dirs, fake_nginx_ok):
     exit_code = site_build.create_nginx_site("messiah", "messiah.example.org")
 
     assert exit_code != 0
+
+
+# --- verify_site_serving / restart prompt (new) ---
+
+def test_prompts_and_restarts_when_default_page_detected(fake_dirs, fake_nginx_ok, monkeypatch):
+    # Simulate: first check finds the default-page problem, restart happens,
+    # second check (after restart) comes back clean.
+    calls = {"count": 0}
+
+    def fake_verify(domain):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return ["IPv6: still serving the default nginx page, not stmarks.example.org"]
+        return []
+
+    monkeypatch.setattr(site_build, "verify_site_serving", fake_verify)
+    monkeypatch.setattr("builtins.input", lambda prompt: "y")
+
+    restart_calls = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["systemctl", "restart"]:
+            restart_calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(site_build.subprocess, "run", fake_run)
+
+    exit_code = site_build.create_nginx_site("stmarks", "stmarks.example.org")
+
+    assert exit_code == 0
+    assert len(restart_calls) == 1
+    assert calls["count"] == 2  # verified before AND after restart
+
+
+def test_declines_restart_leaves_site_configured(fake_dirs, fake_nginx_ok, monkeypatch):
+    monkeypatch.setattr(
+        site_build,
+        "verify_site_serving",
+        lambda domain: ["IPv6: still serving the default nginx page, not stmarks.example.org"],
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+
+    restart_calls = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["systemctl", "restart"]:
+            restart_calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(site_build.subprocess, "run", fake_run)
+
+    exit_code = site_build.create_nginx_site("stmarks", "stmarks.example.org")
+
+    # Config is valid and in place — this isn't a failure, just an unresolved warning.
+    assert exit_code == 0
+    assert len(restart_calls) == 0
+    config_path = fake_dirs["sites_available"] / "stmarks"
+    assert config_path.is_file()
+
+
+def test_no_prompt_when_site_verifies_clean(fake_dirs, fake_nginx_ok, monkeypatch):
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or "n")
+
+    exit_code = site_build.create_nginx_site("stmarks", "stmarks.example.org")
+
+    assert exit_code == 0
+    assert prompts == []  # input() was never called
 
 
 # --- main() end-to-end ---

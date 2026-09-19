@@ -18,6 +18,7 @@ Example:
 """
 
 import argparse
+import http.client
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,11 @@ from pathlib import Path
 WEB_ROOT_BASE = Path("/srv/www")
 NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available")
 NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
+
+# Marker text from Debian/Ubuntu's default nginx page. If we see this when
+# we expected the site we just created, nginx is still routing the request
+# to the default site instead of the new one.
+DEFAULT_NGINX_MARKER = "Welcome to nginx!"
 
 NGINX_TEMPLATE = """server {{
     listen 80;
@@ -151,6 +157,53 @@ def reload_nginx() -> tuple[bool, str]:
         return False, "systemctl command not found"
 
 
+def restart_nginx() -> tuple[bool, str]:
+    """Run `systemctl restart nginx`. Returns (success, output)."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "restart", "nginx"], capture_output=True, text=True, check=False
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        return result.returncode == 0, output
+    except FileNotFoundError:
+        return False, "systemctl command not found"
+
+
+def verify_site_serving(domain: str) -> list[str]:
+    """
+    Probe the site over both IPv4 and IPv6 loopback with the right Host
+    header, and check whether nginx is actually routing to it.
+
+    `reload` re-reads config files but doesn't reliably rebind newly added
+    listen sockets, so a config that tests clean and reloads without error
+    can still silently fall through to the default site. This catches that.
+
+    Returns a list of human-readable problems. Empty list = looks fine.
+    """
+    problems = []
+    for family_name, host in [("IPv4", "127.0.0.1"), ("IPv6", "::1")]:
+        try:
+            conn = http.client.HTTPConnection(host, 80, timeout=3)
+            conn.putrequest("GET", "/", skip_host=True)
+            conn.putheader("Host", domain)
+            conn.endheaders()
+            resp = conn.getresponse()
+            body = resp.read(4096).decode(errors="replace")
+            conn.close()
+            if DEFAULT_NGINX_MARKER in body:
+                problems.append(
+                    f"{family_name}: still serving the default nginx page, not {domain}"
+                )
+        except OSError as e:
+            problems.append(f"{family_name}: could not connect ({e})")
+    return problems
+
+
+def prompt_yes_no(question: str) -> bool:
+    answer = input(f"{question} [y/N]: ").strip().lower()
+    return answer == "y"
+
+
 def create_nginx_site(name: str, domain: str) -> int:
     """
     Generate an nginx config for <name>, enable it, test it, and reload nginx.
@@ -229,6 +282,41 @@ def create_nginx_site(name: str, domain: str) -> int:
         print(output, file=sys.stderr)
         return 1
     print("Reloaded nginx")
+
+    # --- Verify the site is actually reachable, not just configured ---
+    problems = verify_site_serving(domain)
+    if problems:
+        print()
+        print("WARNING: the site may not be serving correctly yet:")
+        for p in problems:
+            print(f"  - {p}")
+        print(
+            "This usually happens when 'reload' doesn't rebind a newly added "
+            "listen socket. A full restart fixes it, but briefly disconnects "
+            "every site on this server, not just this one."
+        )
+        if prompt_yes_no("Restart nginx now to fix this?"):
+            ok, output = restart_nginx()
+            if not ok:
+                print("ERROR: nginx restart failed.", file=sys.stderr)
+                print(output, file=sys.stderr)
+                return 1
+            print("Restarted nginx")
+
+            problems = verify_site_serving(domain)
+            if problems:
+                print("WARNING: site still doesn't look right after restart:")
+                for p in problems:
+                    print(f"  - {p}")
+            else:
+                print("Verified: site is serving correctly.")
+        else:
+            print(
+                "Skipped restart. The config is valid and enabled, but the site "
+                "may not be reachable until you run: sudo systemctl restart nginx"
+            )
+    else:
+        print("Verified: site is serving correctly.")
 
     return 0
 

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
 Parish Site Builder
-v0.3 — pre-flight validation, then create a web root directory AND a
-working nginx site.
+v0.3.1 — same behavior as v0.3 (pre-flight validation, nginx site creation,
+rollback on failure, post-reload verification), with clearer, more explicit
+CLI output. Every check and every filesystem/nginx change is reported by
+name and full path, with PASS/FAIL/OK indicators, instead of terse one-line
+status messages.
 
 Before touching anything, checks: valid site name, valid domain, nginx
 installed and running, no existing web dir or config, and that the domain
@@ -96,12 +99,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# =====================================================================
+# Validation (pure functions, no I/O side effects beyond reading state)
+# =====================================================================
+
 def is_valid_site_name(name: str) -> bool:
     return bool(SITE_NAME_PATTERN.match(name))
 
 
 def is_valid_domain(domain: str) -> bool:
     return bool(DOMAIN_PATTERN.match(domain)) and len(domain) <= 253
+
+
+def nginx_installed() -> bool:
+    return shutil.which("nginx") is not None
 
 
 def nginx_is_running() -> bool:
@@ -142,149 +153,203 @@ def find_domain_conflict(domain: str) -> str | None:
     return None
 
 
-def run_preflight_checks(name: str, domain: str) -> list[tuple[str, bool, str]]:
+def run_preflight_checks(name: str, domain: str) -> list[dict]:
     """
     Run every check before anything is created or changed.
 
-    Returns a list of (label, passed, detail) tuples. `detail` is a
-    human-readable reason, only meaningful when passed is False.
+    Returns a list of dicts: {"label": str, "passed": bool, "detail": str}.
+    `detail` may be populated on a pass too (e.g. showing the nginx binary
+    path), not just on failure.
     """
     checks = []
 
-    checks.append((
-        "Valid site name",
-        is_valid_site_name(name),
-        f"'{name}' must start with a letter/number and contain only letters, "
-        "numbers, hyphens, and underscores (max 63 characters).",
-    ))
+    checks.append({
+        "label": "Valid site name",
+        "passed": is_valid_site_name(name),
+        "detail": "" if is_valid_site_name(name) else (
+            f"'{name}' must start with a letter/number and contain only letters, "
+            "numbers, hyphens, and underscores (max 63 characters)."
+        ),
+    })
 
-    checks.append((
-        "Valid domain",
-        is_valid_domain(domain),
-        f"'{domain}' doesn't look like a valid domain/hostname.",
-    ))
+    checks.append({
+        "label": "Valid domain",
+        "passed": is_valid_domain(domain),
+        "detail": "" if is_valid_domain(domain) else (
+            f"'{domain}' doesn't look like a valid domain/hostname."
+        ),
+    })
 
-    installed = nginx_installed()
-    checks.append((
-        "nginx installed",
-        installed,
-        "nginx is not installed on this system.",
-    ))
+    nginx_path = shutil.which("nginx")
+    installed = nginx_path is not None
+    checks.append({
+        "label": "nginx installed",
+        "passed": installed,
+        "detail": nginx_path if installed else "nginx is not installed on this system.",
+    })
 
     if installed:
         running = nginx_is_running()
-        checks.append((
-            "nginx running",
-            running,
-            "nginx is installed but not running (try: sudo systemctl start nginx).",
-        ))
+        checks.append({
+            "label": "nginx running",
+            "passed": running,
+            "detail": "" if running else (
+                "nginx is installed but not running (try: sudo systemctl start nginx)."
+            ),
+        })
     else:
         # Don't bother checking if it's running when it isn't even installed.
-        checks.append(("nginx running", False, "nginx is not installed."))
+        checks.append({"label": "nginx running", "passed": False, "detail": "nginx is not installed."})
 
-    web_exists = (WEB_ROOT_BASE / name).exists()
-    checks.append((
-        "Web directory doesn't already exist",
-        not web_exists,
-        f"{WEB_ROOT_BASE / name} already exists.",
-    ))
+    site_dir = WEB_ROOT_BASE / name
+    web_exists = site_dir.exists()
+    checks.append({
+        "label": "Site directory available",
+        "passed": not web_exists,
+        "detail": "" if not web_exists else f"{site_dir} already exists.",
+    })
 
-    config_exists = (NGINX_SITES_AVAILABLE / name).exists() or (NGINX_SITES_ENABLED / name).exists()
-    checks.append((
-        "No existing site configuration",
-        not config_exists,
-        f"An nginx config for '{name}' already exists.",
-    ))
+    config_path = NGINX_SITES_AVAILABLE / name
+    symlink_path = NGINX_SITES_ENABLED / name
+    config_exists = config_path.exists() or symlink_path.exists()
+    checks.append({
+        "label": "Nginx configuration available",
+        "passed": not config_exists,
+        "detail": "" if not config_exists else f"An nginx config for '{name}' already exists.",
+    })
 
     conflict = find_domain_conflict(domain)
-    checks.append((
-        "Domain not already in use",
-        conflict is None,
-        f"Domain '{domain}' is already used by site config '{conflict}'." if conflict else "",
-    ))
+    checks.append({
+        "label": "Domain not already in use",
+        "passed": conflict is None,
+        "detail": "" if conflict is None else (
+            f"Domain '{domain}' is already used by site config '{conflict}'."
+        ),
+    })
 
     return checks
 
 
-def print_preflight_results(checks: list[tuple[str, bool, str]]) -> bool:
+def print_preflight_results(checks: list[dict]) -> bool:
     """Print the checklist, return True if every check passed."""
-    print("Checking...")
-    print()
+    print("Preflight checks:")
     all_ok = True
-    for label, ok, _detail in checks:
-        symbol = "\u2713" if ok else "\u2717"
-        print(f"{symbol} {label}")
-        if not ok:
+    for check in checks:
+        status = "PASS" if check["passed"] else "FAIL"
+        line = f"  [{status}] {check['label']}"
+        if check["detail"]:
+            line += f": {check['detail']}"
+        print(line)
+        if not check["passed"]:
             all_ok = False
 
     if not all_ok:
-        print()
-        print("ERROR")
-        print()
-        for label, ok, detail in checks:
-            if not ok:
-                print(detail)
         print()
         print("No changes were made.")
 
     return all_ok
 
 
-def create_site_directory(name: str) -> int:
-    """
-    Create /srv/www/<name> and drop in a placeholder index.html.
+# =====================================================================
+# Site creation — each function does one thing and reports exactly what
+# it did (or didn't) do, with full paths.
+# =====================================================================
 
-    Returns an exit code: 0 on success, non-zero on failure.
-    Follows the "no changes made" principle — if anything is wrong,
-    we bail out before touching the filesystem.
+def create_web_root(name: str) -> tuple[int, Path | None]:
+    """
+    Create /srv/www/<name>.
+    Returns (exit_code, path_or_None).
     """
     site_path = WEB_ROOT_BASE / name
 
-    # --- Validation before any changes ---
     if site_path.exists():
-        print(f"ERROR: {site_path} already exists. No changes were made.", file=sys.stderr)
-        return 1
+        print(f"  [FAIL] Create directory: {site_path} already exists")
+        return 1, None
 
     if not WEB_ROOT_BASE.exists():
         print(
-            f"ERROR: {WEB_ROOT_BASE} does not exist. Create it first (e.g. sudo mkdir -p {WEB_ROOT_BASE}). "
-            "No changes were made.",
-            file=sys.stderr,
+            f"  [FAIL] Create directory: {WEB_ROOT_BASE} does not exist "
+            f"(create it first, e.g. sudo mkdir -p {WEB_ROOT_BASE})"
         )
-        return 1
+        return 1, None
 
-    # --- Do the thing ---
     try:
         site_path.mkdir(parents=False, exist_ok=False)
     except PermissionError:
-        print(
-            f"ERROR: permission denied creating {site_path}. "
-            "Try running with sudo. No changes were made.",
-            file=sys.stderr,
-        )
-        return 1
+        print(f"  [FAIL] Create directory: permission denied writing {site_path} (try sudo)")
+        return 1, None
     except OSError as e:
-        print(f"ERROR: failed to create {site_path}: {e}", file=sys.stderr)
-        return 1
+        print(f"  [FAIL] Create directory: {site_path}: {e}")
+        return 1, None
 
-    # TODO(v0.3+): set ownership to www-data:www-data.
-    print(f"Created {site_path}")
-    return 0
+    # TODO(v0.4+): set ownership to www-data:www-data.
+    print(f"  [OK] Created directory: {site_path}")
+    return 0, site_path
 
 
-def write_placeholder_index(name: str, domain: str) -> None:
-    """Best-effort: drop a placeholder index.html so the site isn't a bare 404."""
+def write_placeholder_index(name: str, domain: str) -> Path | None:
+    """
+    Best-effort: drop a placeholder index.html so the site isn't a bare 404.
+    Not fatal if this fails — the site still works, it'll just 404 until
+    real content is added.
+    Returns the path on success, None on failure.
+    """
     index_path = WEB_ROOT_BASE / name / "index.html"
     try:
         index_path.write_text(PLACEHOLDER_INDEX.format(domain=domain))
-        print(f"Created {index_path}")
+        print(f"  [OK] Created index: {index_path}")
+        return index_path
     except OSError as e:
-        # Not fatal — the site still works, it'll just 404 until real content is added.
-        print(f"WARNING: could not write placeholder index.html: {e}", file=sys.stderr)
+        print(f"  [WARN] Could not write index: {index_path}: {e}")
+        return None
 
 
-def nginx_installed() -> bool:
-    return shutil.which("nginx") is not None
+def write_nginx_config(name: str, domain: str) -> tuple[int, Path | None]:
+    """
+    Write /etc/nginx/sites-available/<name> from the template.
+    Returns (exit_code, path_or_None).
+    """
+    config_path = NGINX_SITES_AVAILABLE / name
+    web_root = WEB_ROOT_BASE / name
+
+    if config_path.exists():
+        print(f"  [FAIL] Create Nginx config: {config_path} already exists")
+        return 1, None
+
+    config_text = NGINX_TEMPLATE.format(domain=domain, web_root=web_root)
+    try:
+        config_path.write_text(config_text)
+    except PermissionError:
+        print(f"  [FAIL] Create Nginx config: permission denied writing {config_path} (try sudo)")
+        return 1, None
+    except OSError as e:
+        print(f"  [FAIL] Create Nginx config: {config_path}: {e}")
+        return 1, None
+
+    print(f"  [OK] Created Nginx config: {config_path}")
+    return 0, config_path
+
+
+def enable_site(name: str, config_path: Path) -> tuple[int, Path | None]:
+    """
+    Symlink /etc/nginx/sites-enabled/<name> -> config_path.
+    Returns (exit_code, symlink_path_or_None). Does NOT roll back
+    config_path on failure — the caller decides what to do with that.
+    """
+    symlink_path = NGINX_SITES_ENABLED / name
+
+    if symlink_path.exists():
+        print(f"  [FAIL] Enable site: {symlink_path} already exists")
+        return 1, None
+
+    try:
+        symlink_path.symlink_to(config_path)
+    except OSError as e:
+        print(f"  [FAIL] Enable site: {symlink_path}: {e}")
+        return 1, None
+
+    print(f"  [OK] Enabled site: {symlink_path} -> {config_path}")
+    return 0, symlink_path
 
 
 def test_nginx_config() -> tuple[bool, str]:
@@ -323,6 +388,48 @@ def restart_nginx() -> tuple[bool, str]:
         return False, "systemctl command not found"
 
 
+def validate_and_reload(config_path: Path, symlink_path: Path) -> int:
+    """
+    Section: "Validating Nginx configuration:" — run `nginx -t`, and if it
+    passes, reload nginx. Rolls back (removes config_path and symlink_path)
+    if the test fails, so a bad config never reaches the running nginx.
+    """
+    print("Validating Nginx configuration:")
+
+    ok, output = test_nginx_config()
+    if not ok:
+        print("  [FAIL] nginx -t")
+        for line in output.strip().splitlines():
+            print(f"         {line}")
+        symlink_path.unlink(missing_ok=True)
+        config_path.unlink(missing_ok=True)
+        print()
+        print(f"  Rolled back: removed {symlink_path} and {config_path}")
+        print("  nginx was NOT reloaded. No other site was affected.")
+        return 1
+    print("  [PASS] nginx -t")
+
+    ok, output = reload_nginx()
+    if not ok:
+        print("  [FAIL] Reload nginx")
+        for line in output.strip().splitlines():
+            print(f"         {line}")
+        print()
+        print(
+            "  Configuration is valid and in place, but nginx wasn't reloaded. "
+            "Run 'sudo systemctl reload nginx' manually."
+        )
+        return 1
+    print("  [OK] Reloaded nginx")
+
+    return 0
+
+
+def prompt_yes_no(question: str) -> bool:
+    answer = input(f"{question} [y/N]: ").strip().lower()
+    return answer == "y"
+
+
 def verify_site_serving(domain: str) -> list[str]:
     """
     Probe the site over both IPv4 and IPv6 loopback with the right Host
@@ -353,156 +460,117 @@ def verify_site_serving(domain: str) -> list[str]:
     return problems
 
 
-def prompt_yes_no(question: str) -> bool:
-    answer = input(f"{question} [y/N]: ").strip().lower()
-    return answer == "y"
-
-
-def create_nginx_site(name: str, domain: str) -> int:
+def verify_and_maybe_restart(domain: str) -> int:
     """
-    Generate an nginx config for <name>, enable it, test it, and reload nginx.
-
-    Rolls back (removes config + symlink) if the nginx test fails, so a bad
-    config for this site never gets a chance to break nginx for others.
+    Section: "Verifying site:" — check the site is actually reachable, and
+    if not, explain why and offer to restart nginx. Never rolls back — the
+    config is valid and enabled either way, this only affects whether the
+    running nginx process has picked it up yet.
     """
-    if not nginx_installed():
-        print("ERROR: nginx is not installed. No changes were made.", file=sys.stderr)
-        return 1
+    print("Verifying site:")
 
-    config_path = NGINX_SITES_AVAILABLE / name
-    symlink_path = NGINX_SITES_ENABLED / name
-    web_root = WEB_ROOT_BASE / name
+    problems = verify_site_serving(domain)
+    if not problems:
+        print(f"  [PASS] {domain} is being served correctly")
+        return 0
 
-    # --- Validation before any changes ---
-    if config_path.exists():
+    print(f"  [FAIL] {domain} is not being served correctly")
+    for p in problems:
+        print(f"         {p}")
+    print()
+    print(
+        "  This usually happens when 'reload' doesn't rebind a newly added "
+        "listen socket. A full restart fixes it, but briefly disconnects "
+        "every site on this server, not just this one."
+    )
+
+    if not prompt_yes_no("Restart nginx now to fix this?"):
         print(
-            f"ERROR: {config_path} already exists. No changes were made.",
-            file=sys.stderr,
+            "  Skipped restart. The config is valid and enabled, but the site "
+            "may not be reachable until you run: sudo systemctl restart nginx"
         )
-        return 1
+        return 0
 
-    if symlink_path.exists():
-        print(
-            f"ERROR: {symlink_path} already exists. No changes were made.",
-            file=sys.stderr,
-        )
-        return 1
-
-    # --- Write the config ---
-    config_text = NGINX_TEMPLATE.format(domain=domain, web_root=web_root)
-    try:
-        config_path.write_text(config_text)
-    except PermissionError:
-        print(
-            f"ERROR: permission denied writing {config_path}. Try running with sudo. "
-            "No changes were made.",
-            file=sys.stderr,
-        )
-        return 1
-    except OSError as e:
-        print(f"ERROR: failed to write {config_path}: {e}", file=sys.stderr)
-        return 1
-    print(f"Created {config_path}")
-
-    # --- Symlink it into sites-enabled ---
-    try:
-        symlink_path.symlink_to(config_path)
-    except OSError as e:
-        config_path.unlink(missing_ok=True)
-        print(f"ERROR: failed to symlink {symlink_path}: {e}. Rolled back.", file=sys.stderr)
-        return 1
-    print(f"Enabled {symlink_path}")
-
-    # --- Test the config before touching the running nginx ---
-    ok, output = test_nginx_config()
+    ok, output = restart_nginx()
     if not ok:
-        symlink_path.unlink(missing_ok=True)
-        config_path.unlink(missing_ok=True)
-        print("ERROR: nginx config test failed. Rolled back, nginx was NOT reloaded.", file=sys.stderr)
-        print(output, file=sys.stderr)
+        print("  [FAIL] Restart nginx")
+        for line in output.strip().splitlines():
+            print(f"         {line}")
         return 1
-    print("nginx config test passed")
+    print("  [OK] Restarted nginx")
 
-    # --- Reload nginx ---
-    ok, output = reload_nginx()
-    if not ok:
-        # Config is valid and in place, it just didn't take effect yet.
-        # Don't roll back — the admin can reload manually once they see this.
-        print(
-            "WARNING: nginx config is valid but reload failed. "
-            "Run 'sudo systemctl reload nginx' manually.",
-            file=sys.stderr,
-        )
-        print(output, file=sys.stderr)
-        return 1
-    print("Reloaded nginx")
-
-    # --- Verify the site is actually reachable, not just configured ---
     problems = verify_site_serving(domain)
     if problems:
-        print()
-        print("WARNING: the site may not be serving correctly yet:")
+        print(f"  [FAIL] {domain} still isn't being served correctly after restart")
         for p in problems:
-            print(f"  - {p}")
-        print(
-            "This usually happens when 'reload' doesn't rebind a newly added "
-            "listen socket. A full restart fixes it, but briefly disconnects "
-            "every site on this server, not just this one."
-        )
-        if prompt_yes_no("Restart nginx now to fix this?"):
-            ok, output = restart_nginx()
-            if not ok:
-                print("ERROR: nginx restart failed.", file=sys.stderr)
-                print(output, file=sys.stderr)
-                return 1
-            print("Restarted nginx")
-
-            problems = verify_site_serving(domain)
-            if problems:
-                print("WARNING: site still doesn't look right after restart:")
-                for p in problems:
-                    print(f"  - {p}")
-            else:
-                print("Verified: site is serving correctly.")
-        else:
-            print(
-                "Skipped restart. The config is valid and enabled, but the site "
-                "may not be reachable until you run: sudo systemctl restart nginx"
-            )
-    else:
-        print("Verified: site is serving correctly.")
-
+            print(f"         {p}")
+        return 1
+    print(f"  [PASS] {domain} is being served correctly")
     return 0
 
+
+# =====================================================================
+# Orchestration
+# =====================================================================
 
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    name = args.name
     domain = args.domain or args.name
 
-    checks = run_preflight_checks(args.name, domain)
+    print(f"Site:   {name}")
+    print(f"Domain: {domain}")
+    print()
+
+    checks = run_preflight_checks(name, domain)
     if not print_preflight_results(checks):
         return 1
-
-    print()
-    print("Creating site...")
     print()
 
-    rc = create_site_directory(args.name)
+    created: list[Path] = []
+
+    print("Creating site:")
+    rc, web_root_path = create_web_root(name)
     if rc != 0:
         return rc
+    created.append(web_root_path)
 
-    write_placeholder_index(args.name, domain)
+    index_path = write_placeholder_index(name, domain)
+    if index_path is not None:
+        created.append(index_path)
 
-    rc = create_nginx_site(args.name, domain)
+    rc, config_path = write_nginx_config(name, domain)
     if rc != 0:
         return rc
+    created.append(config_path)
 
+    rc, symlink_path = enable_site(name, config_path)
+    if rc != 0:
+        # config_path was written but never enabled — clean it up too,
+        # since nothing was ever tested or reloaded with it in place.
+        config_path.unlink(missing_ok=True)
+        return rc
+    created.append(symlink_path)
     print()
+
+    rc = validate_and_reload(config_path, symlink_path)
+    if rc != 0:
+        return rc
+    print()
+
+    verify_and_maybe_restart(domain)
+    print()
+
     print("Site created successfully.")
-    print(f"    Web root: {WEB_ROOT_BASE / args.name}")
-    print(f"    Config:   {NGINX_SITES_AVAILABLE / args.name}")
-    print(f"    Status:   http://{domain}")
+    print()
+    print(f"Site:   {name}")
+    print(f"Domain: {domain}")
+    print()
+    print("Created:")
+    for path in created:
+        print(f"  {path}")
+
     return 0
 
 

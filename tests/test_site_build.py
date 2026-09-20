@@ -688,3 +688,316 @@ def test_declines_restart_leaves_site_configured(fake_dirs, fake_nginx_ok, monke
     assert exit_code == 0
     assert len(restart_calls) == 0
     assert (fake_dirs["sites_available"] / "stmarks").is_file()
+
+
+# =====================================================================
+# v0.5 — SSL via certbot
+# =====================================================================
+
+@pytest.fixture
+def fake_ssl_dirs(fake_dirs, monkeypatch, tmp_path):
+    """Extends fake_dirs with an isolated /etc/letsencrypt/live equivalent."""
+    letsencrypt = tmp_path / "letsencrypt-live"
+    letsencrypt.mkdir()
+    monkeypatch.setattr(site_build, "LETSENCRYPT_LIVE_DIR", letsencrypt)
+    fake_dirs["letsencrypt"] = letsencrypt
+    return fake_dirs
+
+
+@pytest.mark.parametrize("email,expected", [
+    ("admin@example.org", True),
+    ("a@b.co", True),
+    ("not-an-email", False),
+    ("", False),
+    ("missing-domain@", False),
+])
+def test_is_valid_email(email, expected):
+    assert site_build.is_valid_email(email) == expected
+
+
+def test_parse_cert_expiry_handles_openssl_format():
+    dt = site_build.parse_cert_expiry("notAfter=Jan  1 00:00:00 2099 GMT")
+    assert dt is not None
+    assert dt.year == 2099
+
+
+def test_parse_cert_expiry_returns_none_on_garbage():
+    assert site_build.parse_cert_expiry("not a date at all") is None
+
+
+def test_cert_expiry_days_none_when_no_cert(fake_ssl_dirs):
+    assert site_build.cert_expiry_days("messiah.example.org") is None
+
+
+def test_cert_expiry_days_reads_real_file(fake_ssl_dirs, monkeypatch):
+    cert_dir = fake_ssl_dirs["letsencrypt"] / "messiah.example.org"
+    cert_dir.mkdir(parents=True)
+    (cert_dir / "fullchain.pem").write_text("fake")
+
+    def fake_run(cmd, **kw):
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="notAfter=Jan  1 00:00:00 2099 GMT\n", stderr="")
+
+    monkeypatch.setattr(site_build.subprocess, "run", fake_run)
+    days = site_build.cert_expiry_days("messiah.example.org")
+    assert days is not None and days > 0
+
+
+def test_format_cert_status_dash_when_none(fake_ssl_dirs):
+    assert site_build.format_cert_status("messiah.example.org") == "-"
+
+
+# --- preflight: SSL-specific checks ---
+
+def test_ssl_checks_catch_bare_domain(fake_ssl_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    checks = site_build.run_ssl_checks("messiah", "admin@example.org")
+    results = {c["label"]: c["passed"] for c in checks}
+    assert results["Domain looks like a real hostname"] is False
+
+
+def test_ssl_checks_catch_invalid_email(fake_ssl_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    checks = site_build.run_ssl_checks("messiah.example.org", "not-an-email")
+    results = {c["label"]: c["passed"] for c in checks}
+    assert results["Valid email"] is False
+
+
+def test_ssl_checks_catch_missing_certbot(fake_ssl_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: None)
+    checks = site_build.run_ssl_checks("messiah.example.org", "admin@example.org")
+    results = {c["label"]: c["passed"] for c in checks}
+    assert results["certbot installed"] is False
+
+
+def test_ssl_checks_catch_existing_cert_collision(fake_ssl_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    (fake_ssl_dirs["letsencrypt"] / "messiah.example.org").mkdir(parents=True)
+    checks = site_build.run_ssl_checks("messiah.example.org", "admin@example.org")
+    results = {c["label"]: c["passed"] for c in checks}
+    assert results["No existing certificate for domain"] is False
+
+
+def test_enable_ssl_site_checks_require_exists_enabled_not_already_ssl(fake_ssl_dirs):
+    # unknown site
+    checks = site_build.run_enable_ssl_site_checks("nonexistent")
+    assert {c["label"]: c["passed"] for c in checks}["Site exists"] is False
+
+    # disabled site
+    (fake_ssl_dirs["sites_available"] / "messiah").write_text("server {\n server_name messiah.example.org;\n}\n")
+    checks = site_build.run_enable_ssl_site_checks("messiah")
+    results = {c["label"]: c["passed"] for c in checks}
+    assert results["Site exists"] is True
+    assert results["Site is enabled"] is False
+
+    # already SSL
+    (fake_ssl_dirs["sites_enabled"] / "messiah").symlink_to(fake_ssl_dirs["sites_available"] / "messiah")
+    (fake_ssl_dirs["sites_available"] / "messiah").write_text(
+        "server {\n listen 443 ssl;\n ssl_certificate /x;\n server_name messiah.example.org;\n}\n"
+    )
+    checks = site_build.run_enable_ssl_site_checks("messiah")
+    results = {c["label"]: c["passed"] for c in checks}
+    assert results["Site is not already SSL-enabled"] is False
+
+
+# --- create --ssl: happy path ---
+
+def _fake_certbot_and_openssl(letsencrypt_dir):
+    def fake_run(cmd, cwd=None, env=None, **kwargs):
+        if cmd[0] == "certbot" and cmd[1] == "certonly":
+            domain = cmd[cmd.index("-d") + 1]
+            cert_dir = letsencrypt_dir / domain
+            cert_dir.mkdir(parents=True, exist_ok=True)
+            (cert_dir / "fullchain.pem").write_text("fake cert")
+            (cert_dir / "privkey.pem").write_text("fake key")
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout="ok", stderr="")
+        if cmd[0] == "openssl":
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout="notAfter=Jan  1 00:00:00 2099 GMT\n", stderr="")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="ok", stderr="")
+    return fake_run
+
+
+def test_create_with_ssl_produces_https_config(fake_ssl_dirs, fake_nginx_ok, monkeypatch):
+    monkeypatch.setattr(site_build.subprocess, "run", _fake_certbot_and_openssl(fake_ssl_dirs["letsencrypt"]))
+    monkeypatch.setattr(site_build, "verify_https_serving", lambda d: [])
+
+    exit_code = site_build.main([
+        "create", "messiah", "--domain", "messiah.example.org",
+        "--ssl", "--email", "admin@example.org",
+    ])
+
+    assert exit_code == 0
+    config_text = (fake_ssl_dirs["sites_available"] / "messiah").read_text()
+    assert "listen 443 ssl;" in config_text
+    assert "return 301 https://$host$request_uri;" in config_text
+    cert_dir = fake_ssl_dirs["letsencrypt"] / "messiah.example.org"
+    assert str(cert_dir / "fullchain.pem") in config_text
+    assert str(cert_dir / "privkey.pem") in config_text
+
+
+def test_create_with_ssl_calls_certonly_webroot_not_nginx_plugin(fake_ssl_dirs, fake_nginx_ok, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, cwd=None, env=None, **kwargs):
+        if cmd[0] == "certbot":
+            calls.append(cmd)
+            if cmd[1] == "certonly":
+                domain = cmd[cmd.index("-d") + 1]
+                cert_dir = fake_ssl_dirs["letsencrypt"] / domain
+                cert_dir.mkdir(parents=True, exist_ok=True)
+                (cert_dir / "fullchain.pem").write_text("x")
+                (cert_dir / "privkey.pem").write_text("x")
+        if cmd[0] == "openssl":
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout="notAfter=Jan  1 00:00:00 2099 GMT\n", stderr="")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(site_build.subprocess, "run", fake_run)
+    monkeypatch.setattr(site_build, "verify_https_serving", lambda d: [])
+
+    site_build.main([
+        "create", "messiah", "--domain", "messiah.example.org",
+        "--ssl", "--email", "admin@example.org",
+    ])
+
+    assert calls
+    assert calls[0][:3] == ["certbot", "certonly", "--webroot"]
+    assert "--nginx" not in calls[0]
+
+
+# --- create --ssl: rollback semantics (locked decision: whole create fails) ---
+
+def test_create_ssl_failure_rolls_back_entire_site(fake_ssl_dirs, fake_nginx_ok, monkeypatch):
+    def fake_run(cmd, cwd=None, env=None, **kwargs):
+        if cmd[0] == "certbot":
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="DNS problem: NXDOMAIN")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(site_build.subprocess, "run", fake_run)
+
+    exit_code = site_build.main([
+        "create", "messiah", "--domain", "messiah.example.org",
+        "--ssl", "--email", "admin@example.org",
+    ])
+
+    assert exit_code != 0
+    assert not (fake_ssl_dirs["web_root"] / "messiah").exists()
+    assert not (fake_ssl_dirs["sites_available"] / "messiah").exists()
+    assert not (fake_ssl_dirs["sites_enabled"] / "messiah").exists()
+
+
+def test_create_rejects_ssl_with_bare_domain_before_any_changes(fake_ssl_dirs, fake_nginx_ok):
+    exit_code = site_build.main([
+        "create", "messiah", "--ssl", "--email", "admin@example.org",
+    ])  # domain defaults to "messiah" — no dot
+
+    assert exit_code != 0
+    assert not (fake_ssl_dirs["web_root"] / "messiah").exists()
+
+
+def test_create_rejects_ssl_with_invalid_email_before_any_changes(fake_ssl_dirs, fake_nginx_ok):
+    exit_code = site_build.main([
+        "create", "messiah", "--domain", "messiah.example.org",
+        "--ssl", "--email", "garbage",
+    ])
+
+    assert exit_code != 0
+    assert not (fake_ssl_dirs["web_root"] / "messiah").exists()
+
+
+# --- enable-ssl: rollback semantics (locked decision: only SSL rolls back, site stays) ---
+
+def test_enable_ssl_failure_leaves_existing_site_untouched(fake_ssl_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    site_dir, config_path = make_site(fake_ssl_dirs, "stmarks", domain="stmarks.example.org", enabled=True)
+    original_config = config_path.read_text()
+
+    def fake_run(cmd, cwd=None, env=None, **kwargs):
+        if cmd[0] == "certbot":
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="DNS problem: NXDOMAIN")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(site_build.subprocess, "run", fake_run)
+
+    exit_code = site_build.main(["enable-ssl", "stmarks", "--email", "admin@example.org"])
+
+    assert exit_code != 0
+    # Site must remain exactly as it was — this is the key difference from create --ssl.
+    assert config_path.exists()
+    assert config_path.read_text() == original_config
+    assert (fake_ssl_dirs["sites_enabled"] / "stmarks").exists()
+    assert site_dir.exists()
+
+
+def test_enable_ssl_nginx_test_failure_restores_exact_original_config(fake_ssl_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    site_dir, config_path = make_site(fake_ssl_dirs, "messiah", domain="messiah.example.org", enabled=True)
+    original_config = config_path.read_text()
+
+    def fake_run(cmd, cwd=None, env=None, **kwargs):
+        if cmd[0] == "certbot" and cmd[1] == "certonly":
+            cert_dir = fake_ssl_dirs["letsencrypt"] / "messiah.example.org"
+            cert_dir.mkdir(parents=True, exist_ok=True)
+            (cert_dir / "fullchain.pem").write_text("x")
+            (cert_dir / "privkey.pem").write_text("x")
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout="ok", stderr="")
+        if cmd[:2] == ["nginx", "-t"]:
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="bad ssl directive")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(site_build.subprocess, "run", fake_run)
+
+    exit_code = site_build.main(["enable-ssl", "messiah", "--email", "admin@example.org"])
+
+    assert exit_code != 0
+    # Config restored byte-for-byte to what it was before the SSL rewrite.
+    assert config_path.read_text() == original_config
+
+
+def test_enable_ssl_success_rewrites_config_and_verifies_https(fake_ssl_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    make_site(fake_ssl_dirs, "messiah", domain="messiah.example.org", enabled=True)
+
+    monkeypatch.setattr(site_build.subprocess, "run", _fake_certbot_and_openssl(fake_ssl_dirs["letsencrypt"]))
+    monkeypatch.setattr(site_build, "verify_https_serving", lambda d: [])
+
+    exit_code = site_build.main(["enable-ssl", "messiah", "--email", "admin@example.org"])
+
+    assert exit_code == 0
+    config_text = (fake_ssl_dirs["sites_available"] / "messiah").read_text()
+    assert "listen 443 ssl;" in config_text
+
+
+# --- status/list show cert info ---
+
+def test_status_single_shows_cert_expiry(fake_ssl_dirs, monkeypatch, capsys):
+    make_site(fake_ssl_dirs, "messiah", domain="messiah.example.org", enabled=True)
+    cert_dir = fake_ssl_dirs["letsencrypt"] / "messiah.example.org"
+    cert_dir.mkdir(parents=True)
+    (cert_dir / "fullchain.pem").write_text("fake")
+
+    monkeypatch.setattr(site_build, "verify_site_serving", lambda d: [])
+
+    def fake_run(cmd, **kw):
+        if cmd[0] == "openssl":
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout="notAfter=Jan  1 00:00:00 2099 GMT\n", stderr="")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(site_build.subprocess, "run", fake_run)
+
+    exit_code = site_build.main(["status", "messiah"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "expires in" in out
+
+
+def test_status_single_shows_no_cert_when_http_only(fake_ssl_dirs, monkeypatch, capsys):
+    make_site(fake_ssl_dirs, "messiah", domain="messiah.example.org", enabled=True)
+    monkeypatch.setattr(site_build, "verify_site_serving", lambda d: [])
+    monkeypatch.setattr(site_build.subprocess, "run",
+                         lambda cmd, **kw: subprocess.CompletedProcess(cmd, returncode=0, stdout="ok", stderr=""))
+
+    exit_code = site_build.main(["status", "messiah"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "none (HTTP only)" in out

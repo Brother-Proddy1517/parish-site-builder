@@ -43,7 +43,7 @@ doesn't require nginx or git to actually be installed.
 - [x] v0.3 — pre-flight validation (site name, domain, nginx status, existing config, domain conflicts)
 - [x] v0.3.1 — explicit, path-by-path CLI output for checks and changes
 - [x] v0.4 — subcommands (create/list/status/enable/disable/remove/update) + SSH-based git deployment
-- [ ] v0.5 — SSL via Let's Encrypt / Certbot, cert expiry in `status`
+- [x] v0.5 — SSL via Let's Encrypt (certbot certonly --webroot), enable-ssl command, cert expiry in `status`
 
 ## Testing workflow
 

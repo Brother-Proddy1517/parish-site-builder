@@ -8,12 +8,14 @@
 
 ```
 site_build.py create <name> [--domain DOMAIN] [--git URL] [--branch BRANCH]
+                             [--ssl --email EMAIL]
 site_build.py list
 site_build.py status [name]
 site_build.py enable <name>
 site_build.py disable <name>
 site_build.py remove <name> [--keep-files] [--yes]
 site_build.py update <name>
+site_build.py enable-ssl <name> --email EMAIL
 ```
 
 Every command that changes the filesystem or nginx config must be run as
@@ -238,7 +240,109 @@ If the site has no git repo configured, or `repo/.git` is missing or
 corrupted, `update` fails immediately with a clear message rather than
 attempting anything.
 
-## PRE-FLIGHT CHECKS
+### `enable-ssl <name> --email EMAIL`
+
+Issues a Let's Encrypt certificate for a site that already exists, and
+switches it to HTTPS. This is the standalone path — use it once a site's
+DNS has actually propagated, rather than gambling on `--ssl` at creation
+time before you're sure the domain resolves.
+
+**Requires**, checked before anything happens:
+
+- The site exists and is currently **enabled** (certbot's webroot
+  challenge needs the site actively serving HTTP to place the challenge
+  file where Let's Encrypt's validators can fetch it).
+- The site doesn't already have SSL configured.
+- `certbot` is installed, the email is valid, the domain contains a dot
+  (Let's Encrypt won't issue for bare local names), and no certificate
+  already exists at `/etc/letsencrypt/live/<domain>` for a different
+  reason.
+
+**What it does:**
+
+1. Runs `certbot certonly --webroot -w <current-nginx-root> -d <domain>`.
+2. Rewrites the nginx config: HTTP now redirects to HTTPS, HTTPS serves
+   the site with `ssl_certificate`/`ssl_certificate_key` pointing at the
+   new cert.
+3. Runs `nginx -t`. If it fails, the **config is restored to its exact
+   previous content** — the site keeps serving over HTTP, untouched,
+   exactly as if `enable-ssl` had never been run.
+4. Reloads nginx.
+5. Probes the site over real HTTPS (not loopback — see VERIFICATION
+   below) to confirm the cert and TLS handshake actually work.
+
+**If certificate issuance itself fails** (DNS not propagated yet, rate
+limited, etc.), nothing has touched nginx yet — the site is completely
+unaffected, exactly as it was before the command ran. This is a
+deliberately different failure mode from `create --ssl`: an *existing*
+site should never be put at risk by a failed SSL attempt.
+
+### `create ... --ssl --email EMAIL`
+
+A shortcut for doing SSL setup in the same breath as `create`, for cases
+where you already know the domain resolves (e.g. testing against an
+`sslip.io` address, or a domain you've already pointed at the VPS).
+
+**Important difference from `enable-ssl`:** if certificate issuance
+fails here, **the entire site is rolled back** — nginx config, symlink,
+and the whole site directory — exactly like any other `create` failure
+(e.g. a failed `nginx -t`). This is a deliberate choice: if you asked for
+`--ssl` and didn't get it, you likely don't want an HTTP-only site
+silently left behind that you didn't ask for. If you're not sure DNS is
+ready yet, create the site plain first and run `enable-ssl` once you've
+confirmed it resolves — that path leaves the site alone on failure.
+
+## SSL / CERTIFICATES
+
+**Why `certonly --webroot`, not the `--nginx` plugin:** certbot's
+`--nginx` plugin edits your nginx config file directly to add the SSL
+block. That conflicts with this tool's whole design — we own and
+regenerate every config from our own template, and if certbot edited it
+behind our back, the next regeneration would clobber those changes and
+our rollback guarantees would no longer hold. `certonly --webroot` only
+obtains the certificate files (`/etc/letsencrypt/live/<domain>/
+fullchain.pem` and `privkey.pem`); we write the SSL server block
+ourselves.
+
+**The webroot challenge requires the site to already be live over HTTP.**
+Certbot proves domain ownership by writing a file under
+`<current-nginx-root>/.well-known/acme-challenge/` and having Let's
+Encrypt's servers fetch it over plain HTTP on port 80. This means:
+
+- `enable-ssl` requires the site to be enabled first.
+- `create --ssl` issues the cert *after* the plain-HTTP site has already
+  been created, enabled, and verified reachable — not before.
+
+**Renewal is not reimplemented here.** Installing certbot via `apt` also
+installs a systemd timer that checks for and renews expiring
+certificates automatically, system-wide. This tool's job stops at
+issuance and reporting; re-running renewal logic ourselves would
+duplicate something certbot already does reliably, with real failure
+modes (rate limits, etc.) better left to the well-tested original.
+
+**Expiry is read from the actual certificate file**, not trusted from
+certbot's internal state — `openssl x509 -enddate -noout` against
+`/etc/letsencrypt/live/<domain>/fullchain.pem`. This is the same
+"verify reality" principle behind `verify_site_serving`: what matters is
+what's actually true on disk and over the wire, not what a tool's exit
+code implied.
+
+**HTTPS verification** (after `create --ssl` or `enable-ssl` succeeds)
+makes a real TLS connection to the domain over the public internet —
+unlike the HTTP verification step, this can't use loopback, since a
+successful TLS handshake against the real hostname is itself the
+meaningful signal: it proves the certificate matches the domain and
+chains to a trusted CA, not merely that a file exists somewhere.
+
+**A real constraint worth knowing before you test this:** SSL genuinely
+cannot be exercised against a fake local domain the way HTTP could be
+tested with a hosts-file trick. Let's Encrypt needs to reach your server
+over the real internet on port 80. For testing without owning a domain,
+a free service like `sslip.io` (`<your-vps-ip>.sslip.io` resolves
+automatically to that IP) works well and exercises the exact same flow a
+real parish domain would.
+
+
 
 `create` runs every one of these before making any change. Printed as:
 
@@ -261,6 +365,10 @@ Preflight checks:
 | Valid domain | Malformed hostnames |
 | Valid git URL *(if `--git`)* | Obvious typos — must start with `https://`, `git@`, or `ssh://` |
 | git installed *(if `--git`)* | Missing `git` binary |
+| certbot installed *(if `--ssl`)* | Missing `certbot` binary |
+| Valid email *(if `--ssl`)* | Malformed contact email for Let's Encrypt |
+| Domain looks like a real hostname *(if `--ssl`)* | Bare local names (no dot) that Let's Encrypt can never issue for |
+| No existing certificate for domain *(if `--ssl`)* | Avoids collision-suffix confusion from certbot if a cert directory already exists |
 | nginx installed | Missing `nginx` binary entirely |
 | nginx running | `nginx` installed but the service isn't active |
 | Site directory available | `/srv/www/<name>` already exists |

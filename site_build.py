@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Parish Site Builder
-v0.4 — subcommand CLI (create, list, status, enable, disable, remove,
-update) plus optional git-backed deployment over SSH.
+Parish Site Builder — Ubuntu Server only
+v0.5 — adds optional SSL via Let's Encrypt (certbot), on top of v0.4's
+subcommand CLI (create, list, status, enable, disable, remove, update)
+and SSH-based git deployment.
 
 Directory layout per site:
     /srv/www/<name>/                    site base
@@ -22,14 +23,23 @@ so root is who actually runs git). Add the deploy key to
 GitHub repo. To avoid hanging on the first connection's host-key prompt,
 git commands run with GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new".
 
+SSL uses `certbot certonly --webroot` — never the --nginx plugin, since
+that would let certbot edit nginx configs directly, conflicting with this
+tool owning and regenerating them from its own template. We write the SSL
+server block ourselves, pointing at the standard
+/etc/letsencrypt/live/<domain>/ cert paths. Renewal is left to certbot's
+own systemd timer, not reimplemented here.
+
 Usage:
     site_build.py create <name> [--domain DOMAIN] [--git URL] [--branch BRANCH]
+                                 [--ssl --email EMAIL]
     site_build.py list
     site_build.py status [name]
     site_build.py enable <name>
     site_build.py disable <name>
     site_build.py remove <name> [--keep-files] [--yes]
     site_build.py update <name>
+    site_build.py enable-ssl <name> --email EMAIL
 
 Examples:
     site_build.py create messiah --domain messiah.example.org
@@ -42,13 +52,24 @@ Examples:
         -> same, but clones the repo into /srv/www/messiah/repo and
            points nginx at /srv/www/messiah/repo/public
 
+    site_build.py create messiah --domain messiah.example.org \\
+        --ssl --email admin@example.org
+        -> same, plus issues a Let's Encrypt cert and switches the site
+           to HTTPS (with HTTP redirecting to HTTPS). If issuance fails,
+           the ENTIRE site is rolled back — same as any other create
+           failure. Requires a real, publicly resolvable domain.
+
+    site_build.py enable-ssl messiah --email admin@example.org
+        -> adds SSL to a site that already exists. On failure, only the
+           SSL-specific changes roll back — the site keeps serving HTTP.
+
     site_build.py update messiah
         -> git fetch origin && git reset --hard origin/main && git clean -fd
            in /srv/www/messiah/repo (static files update immediately,
            no nginx reload needed)
 
     site_build.py list      -> table of every site: name, domain, enabled, git
-    site_build.py status              -> table of every site with live HTTP + git status
+    site_build.py status              -> table of every site with live HTTP + git + cert status
     site_build.py status messiah      -> detailed status for just this one site
     site_build.py disable messiah     -> removes the nginx symlink, reloads
     site_build.py enable messiah      -> re-adds it, tests, reloads
@@ -62,14 +83,17 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 WEB_ROOT_BASE = Path("/srv/www")
 NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available")
 NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
+LETSENCRYPT_LIVE_DIR = Path("/etc/letsencrypt/live")
 
 # Marker text from Debian/Ubuntu's default nginx page. If we see this when
 # we expected the site we just created, nginx is still routing the request
@@ -90,10 +114,40 @@ DOMAIN_PATTERN = re.compile(
 # Loose check: just enough to catch typos, not a full URL grammar.
 GIT_URL_PATTERN = re.compile(r"^(https?://|git@|ssh://)\S+$")
 
+# Loose check: just enough to catch typos, not full RFC 5322 validation.
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
 NGINX_TEMPLATE = """server {{
     listen 80;
     listen [::]:80;
     server_name {domain};
+
+    root {web_root};
+    index index.html;
+
+    location / {{
+        try_files $uri $uri/ =404;
+    }}
+}}
+"""
+
+# Used once SSL is enabled. Port 80 redirects to HTTPS; the real site is
+# served only on 443. Written by write_ssl_nginx_config, replacing the
+# plain NGINX_TEMPLATE config in place.
+NGINX_SSL_TEMPLATE = """server {{
+    listen 80;
+    listen [::]:80;
+    server_name {domain};
+    return 301 https://$host$request_uri;
+}}
+
+server {{
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name {domain};
+
+    ssl_certificate {fullchain};
+    ssl_certificate_key {privkey};
 
     root {web_root};
     index index.html;
@@ -178,6 +232,8 @@ def build_parser() -> argparse.ArgumentParser:
     create_p.add_argument("--domain", help="Domain for the nginx server_name. Defaults to the site name.")
     create_p.add_argument("--git", dest="git_repo", help="Git repo SSH URL, e.g. git@github.com:ORG/REPO.git")
     create_p.add_argument("--branch", dest="git_branch", default="main", help="Git branch to deploy (default: main)")
+    create_p.add_argument("--ssl", action="store_true", help="Issue a Let's Encrypt certificate after creating the site.")
+    create_p.add_argument("--email", help="Contact email for Let's Encrypt. Required if --ssl is given.")
 
     subparsers.add_parser("list", help="List all sites")
 
@@ -201,6 +257,10 @@ def build_parser() -> argparse.ArgumentParser:
     update_p = subparsers.add_parser("update", help="Pull the latest version from the linked git repo")
     update_p.add_argument("name")
 
+    enable_ssl_p = subparsers.add_parser("enable-ssl", help="Issue a Let's Encrypt certificate for an existing site")
+    enable_ssl_p.add_argument("name")
+    enable_ssl_p.add_argument("--email", required=True, help="Contact email for Let's Encrypt.")
+
     return parser
 
 
@@ -218,6 +278,10 @@ def is_valid_domain(domain: str) -> bool:
 
 def is_valid_git_url(url: str) -> bool:
     return bool(GIT_URL_PATTERN.match(url))
+
+
+def is_valid_email(email: str) -> bool:
+    return bool(EMAIL_PATTERN.match(email))
 
 
 def nginx_installed() -> bool:
@@ -387,6 +451,96 @@ def print_preflight_results(checks: list[dict]) -> bool:
         print("No changes were made.")
 
     return all_ok
+
+
+def is_ssl_enabled(name: str) -> bool:
+    """Whether a site's nginx config already has an SSL server block."""
+    config_path = NGINX_SITES_AVAILABLE / name
+    if not config_path.exists():
+        return False
+    try:
+        return "ssl_certificate " in config_path.read_text()
+    except OSError:
+        return False
+
+
+def run_ssl_checks(domain: str, email: str, *, require_no_existing_cert: bool = True) -> list[dict]:
+    """
+    Checks specific to issuing a certificate, shared by `create --ssl` and
+    `enable-ssl`. These can all be evaluated before touching anything —
+    whether the actual issuance succeeds (DNS propagation, rate limits,
+    etc.) can only be known once certbot is actually run.
+    """
+    checks = []
+
+    certbot_path = shutil.which("certbot")
+    checks.append({
+        "label": "certbot installed",
+        "passed": certbot_path is not None,
+        "detail": certbot_path if certbot_path else "certbot is not installed on this system.",
+    })
+
+    valid_email = is_valid_email(email)
+    checks.append({
+        "label": "Valid email",
+        "passed": valid_email,
+        "detail": "" if valid_email else f"'{email}' doesn't look like a valid email address.",
+    })
+
+    has_dot = "." in domain
+    checks.append({
+        "label": "Domain looks like a real hostname",
+        "passed": has_dot,
+        "detail": "" if has_dot else (
+            f"'{domain}' has no dot — Let's Encrypt can't issue certificates for bare "
+            "local names. Use a real domain (or a service like sslip.io for testing)."
+        ),
+    })
+
+    if require_no_existing_cert:
+        cert_dir = LETSENCRYPT_LIVE_DIR / domain
+        exists = cert_dir.exists()
+        checks.append({
+            "label": "No existing certificate for domain",
+            "passed": not exists,
+            "detail": "" if not exists else f"{cert_dir} already exists.",
+        })
+
+    return checks
+
+
+def run_enable_ssl_site_checks(name: str) -> list[dict]:
+    """Checks specific to `enable-ssl`: the site must already exist,
+    be enabled, and not already have SSL configured."""
+    checks = []
+
+    config_path = NGINX_SITES_AVAILABLE / name
+    exists = config_path.exists()
+    checks.append({
+        "label": "Site exists",
+        "passed": exists,
+        "detail": "" if exists else f"No such site: {name}",
+    })
+
+    if exists:
+        enabled = (NGINX_SITES_ENABLED / name).exists()
+        checks.append({
+            "label": "Site is enabled",
+            "passed": enabled,
+            "detail": "" if enabled else (
+                f"'{name}' is disabled. Certbot needs it serving HTTP to complete the "
+                f"challenge — enable it first with: site_build.py enable {name}"
+            ),
+        })
+
+        already_ssl = is_ssl_enabled(name)
+        checks.append({
+            "label": "Site is not already SSL-enabled",
+            "passed": not already_ssl,
+            "detail": "" if not already_ssl else f"'{name}' already has SSL configured.",
+        })
+
+    return checks
 
 
 # =====================================================================
@@ -687,12 +841,190 @@ def verify_and_maybe_restart(domain: str) -> int:
 
 
 # =====================================================================
+# SSL / certbot
+# =====================================================================
+
+def issue_certificate(domain: str, webroot: Path, email: str) -> tuple[bool, str]:
+    """
+    Run `certbot certonly --webroot`. Deliberately NOT the --nginx plugin:
+    that would let certbot edit our nginx config directly, which conflicts
+    with this tool owning and regenerating configs from its own template.
+    certonly only obtains the cert files; we write the SSL server block
+    ourselves.
+    """
+    cmd = [
+        "certbot", "certonly", "--webroot",
+        "-w", str(webroot), "-d", domain,
+        "--non-interactive", "--agree-tos",
+        "-m", email, "--no-eff-email",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        output = (result.stdout or "") + (result.stderr or "")
+        return result.returncode == 0, output
+    except FileNotFoundError:
+        return False, "certbot command not found"
+
+
+def verify_https_serving(domain: str) -> list[str]:
+    """
+    Make a real HTTPS request to the domain (not loopback — SSL requires
+    real, publicly resolvable DNS to have gotten this far at all) and
+    confirm the TLS handshake succeeds and nginx responds. A successful
+    handshake is itself meaningful: it proves the cert matches the domain
+    and chains to a trusted CA, not just that a file exists on disk.
+    """
+    problems = []
+    try:
+        context = ssl.create_default_context()
+        conn = http.client.HTTPSConnection(domain, 443, timeout=5, context=context)
+        conn.request("GET", "/", headers={"Host": domain})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        if resp.status >= 500:
+            problems.append(f"HTTPS request returned status {resp.status}")
+    except ssl.SSLCertVerificationError as e:
+        problems.append(f"Certificate verification failed: {e}")
+    except OSError as e:
+        problems.append(f"Could not connect over HTTPS: {e}")
+    return problems
+
+
+def parse_cert_expiry(openssl_enddate_output: str) -> datetime | None:
+    """Parse `openssl x509 -enddate` output, e.g. 'notAfter=Jan  1 00:00:00 2027 GMT'."""
+    if "=" not in openssl_enddate_output:
+        return None
+    date_part = openssl_enddate_output.split("=", 1)[1].strip()
+    date_part = re.sub(r"\s+GMT$", "", date_part)
+    date_part = re.sub(r"\s+", " ", date_part)
+    try:
+        return datetime.strptime(date_part, "%b %d %H:%M:%S %Y").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def cert_expiry_days(domain: str) -> int | None:
+    """
+    Days until the cert expires, reading the actual cert file rather than
+    trusting certbot's own bookkeeping — consistent with how this tool
+    verifies HTTP reachability by actually probing it, not just trusting
+    nginx's reload exit code. Returns None if no cert is found.
+    """
+    cert_path = LETSENCRYPT_LIVE_DIR / domain / "fullchain.pem"
+    if not cert_path.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["openssl", "x509", "-enddate", "-noout", "-in", str(cert_path)],
+            capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    expiry = parse_cert_expiry(result.stdout.strip())
+    if expiry is None:
+        return None
+    return (expiry - datetime.now(timezone.utc)).days
+
+
+def format_cert_status(domain: str) -> str:
+    """Short form for table display, e.g. '71d', 'EXPIRED 3d ago', or '-'."""
+    days = cert_expiry_days(domain)
+    if days is None:
+        return "-"
+    if days < 0:
+        return f"EXPIRED {abs(days)}d ago"
+    return f"{days}d"
+
+
+def enable_ssl_for_site(meta: SiteMetadata, email: str) -> int:
+    """
+    Issue a certificate and rewrite the site's nginx config for SSL.
+    Rolls back the config (not the whole site) on failure after the
+    config has been touched — the site keeps serving over HTTP. Whether
+    the *whole site* should be rolled back (the `create --ssl` case) is
+    the caller's decision, not this function's.
+    """
+    print("Enabling SSL:")
+
+    ok, output = issue_certificate(meta.domain, meta.nginx_root, email)
+    if not ok:
+        print("  [FAIL] Obtain certificate (certbot certonly --webroot)")
+        for line in output.strip().splitlines():
+            print(f"         {line}")
+        return 1
+    print(f"  [OK] Obtained certificate for {meta.domain}")
+
+    config_path = NGINX_SITES_AVAILABLE / meta.name
+    try:
+        old_text = config_path.read_text()
+    except OSError as e:
+        print(f"  [FAIL] Read existing config: {config_path}: {e}")
+        return 1
+
+    cert_dir = LETSENCRYPT_LIVE_DIR / meta.domain
+    new_text = NGINX_SSL_TEMPLATE.format(
+        domain=meta.domain, web_root=meta.nginx_root,
+        fullchain=cert_dir / "fullchain.pem", privkey=cert_dir / "privkey.pem",
+    )
+    try:
+        config_path.write_text(new_text)
+    except OSError as e:
+        print(f"  [FAIL] Write SSL config: {config_path}: {e}")
+        return 1
+    print(f"  [OK] Updated Nginx config for SSL: {config_path}")
+
+    ok, output = test_nginx_config()
+    if not ok:
+        print("  [FAIL] nginx -t")
+        for line in output.strip().splitlines():
+            print(f"         {line}")
+        config_path.write_text(old_text)
+        print()
+        print(f"  Rolled back: restored {config_path} to its pre-SSL version.")
+        print("  nginx was NOT reloaded. The site is still serving over HTTP only.")
+        return 1
+    print("  [PASS] nginx -t")
+
+    ok, output = reload_nginx()
+    if not ok:
+        print("  [FAIL] Reload nginx")
+        for line in output.strip().splitlines():
+            print(f"         {line}")
+        print()
+        print(
+            "  The SSL config is valid and in place, but nginx wasn't reloaded. "
+            "Run 'sudo systemctl reload nginx' manually."
+        )
+        return 1
+    print("  [OK] Reloaded nginx")
+
+    problems = verify_https_serving(meta.domain)
+    if problems:
+        print(f"  [FAIL] {meta.domain} is not being served correctly over HTTPS")
+        for p in problems:
+            print(f"         {p}")
+        return 1
+    print(f"  [PASS] {meta.domain} is being served correctly over HTTPS")
+
+    days = cert_expiry_days(meta.domain)
+    if days is not None:
+        print(f"  Certificate valid for {days} days")
+
+    return 0
+
+
+# =====================================================================
 # Subcommand handlers
 # =====================================================================
 
 def cmd_create(args) -> int:
     name = args.name
     domain = args.domain or args.name
+    want_ssl = getattr(args, "ssl", False)
+    email = getattr(args, "email", None) or ""
     meta = SiteMetadata(
         name=name, domain=domain,
         git_repo=args.git_repo,
@@ -703,9 +1035,13 @@ def cmd_create(args) -> int:
     print(f"Domain: {meta.domain}")
     if meta.git_repo:
         print(f"Git:    {redact_url(meta.git_repo)} ({meta.git_branch})")
+    if want_ssl:
+        print(f"SSL:    yes ({email or 'no email given'})")
     print()
 
     checks = run_preflight_checks(meta)
+    if want_ssl:
+        checks += run_ssl_checks(meta.domain, email)
     if not print_preflight_results(checks):
         return 1
     print()
@@ -767,12 +1103,28 @@ def cmd_create(args) -> int:
     verify_and_maybe_restart(meta.domain)
     print()
 
+    if want_ssl:
+        rc = enable_ssl_for_site(meta, email)
+        if rc != 0:
+            print()
+            print("SSL setup failed. Per --ssl semantics, rolling back the entire site")
+            print("(same as any other create failure) rather than leaving it on HTTP-only.")
+            symlink_path.unlink(missing_ok=True)
+            config_path.unlink(missing_ok=True)
+            shutil.rmtree(site_dir, ignore_errors=True)
+            reload_nginx()
+            print(f"Rolled back: removed {symlink_path}, {config_path}, and {site_dir}")
+            return 1
+        print()
+
     print("Site created successfully.")
     print()
     print(f"Site:   {meta.name}")
     print(f"Domain: {meta.domain}")
     if meta.git_repo:
         print(f"Git:    {redact_url(meta.git_repo)} ({meta.git_branch})")
+    if want_ssl:
+        print(f"SSL:    https://{meta.domain}")
     print()
     print("Created:")
     for path in created:
@@ -840,6 +1192,14 @@ def _status_single(name: str) -> int:
     else:
         print("Git:     not linked")
 
+    days = cert_expiry_days(domain)
+    if days is None:
+        print("Cert:    none (HTTP only)")
+    elif days < 0:
+        print(f"Cert:    EXPIRED {abs(days)} days ago")
+    else:
+        print(f"Cert:    valid, expires in {days} days")
+
     return 0
 
 
@@ -856,7 +1216,7 @@ def _status_all() -> int:
         print("No sites found.")
         return 0
 
-    print(f"{'SITE':<20}{'HTTP':<8}{'GIT'}")
+    print(f"{'SITE':<20}{'HTTP':<8}{'GIT':<10}{'CERT'}")
     for name in site_names:
         meta = try_read_metadata(name)
         domain = meta.domain if meta else (extract_domain(NGINX_SITES_AVAILABLE / name) or name)
@@ -867,7 +1227,8 @@ def _status_all() -> int:
         else:
             http_status = "off"
         git_display = "linked" if meta and meta.git_repo else "-"
-        print(f"{name:<20}{http_status:<8}{git_display}")
+        cert_display = format_cert_status(domain)
+        print(f"{name:<20}{http_status:<8}{git_display:<10}{cert_display}")
     return 0
 
 
@@ -1012,6 +1373,33 @@ def cmd_update(args) -> int:
     return 0
 
 
+def cmd_enable_ssl(args) -> int:
+    name = args.name
+    email = args.email
+
+    site_checks = run_enable_ssl_site_checks(name)
+    site_exists = any(c["label"] == "Site exists" and c["passed"] for c in site_checks)
+
+    meta = None
+    ssl_checks: list[dict] = []
+    if site_exists:
+        meta = try_read_metadata(name) or SiteMetadata(
+            name=name, domain=extract_domain(NGINX_SITES_AVAILABLE / name) or name,
+        )
+        ssl_checks = run_ssl_checks(meta.domain, email)
+
+    print(f"Site: {name}")
+    if meta:
+        print(f"Domain: {meta.domain}")
+    print()
+
+    if not print_preflight_results(site_checks + ssl_checks):
+        return 1
+    print()
+
+    return enable_ssl_for_site(meta, email)
+
+
 # =====================================================================
 # Orchestration
 # =====================================================================
@@ -1028,6 +1416,7 @@ def main(argv=None) -> int:
         "disable": cmd_disable,
         "remove": cmd_remove,
         "update": cmd_update,
+        "enable-ssl": cmd_enable_ssl,
     }
     return handlers[args.command](args)
 

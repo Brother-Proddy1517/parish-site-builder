@@ -1,39 +1,70 @@
 #!/usr/bin/env python3
 """
 Parish Site Builder
-v0.3.1 — same behavior as v0.3 (pre-flight validation, nginx site creation,
-rollback on failure, post-reload verification), with clearer, more explicit
-CLI output. Every check and every filesystem/nginx change is reported by
-name and full path, with PASS/FAIL/OK indicators, instead of terse one-line
-status messages.
+v0.4 — subcommand CLI (create, list, status, enable, disable, remove,
+update) plus optional git-backed deployment over SSH.
 
-Before touching anything, checks: valid site name, valid domain, nginx
-installed and running, no existing web dir or config, and that the domain
-isn't already claimed by a different site. If anything fails, nothing is
-created or changed.
+Directory layout per site:
+    /srv/www/<name>/                    site base
+    /srv/www/<name>/.parish-site.json   metadata (domain, linked repo/branch)
+    /srv/www/<name>/repo/               git working tree (if git-linked)
+    /srv/www/<name>/repo/public/        nginx root (if git-linked)
+    /srv/www/<name>/index.html          nginx root content (if NOT git-linked)
+
+Keeping the git checkout in repo/ and only serving repo/public/ means
+.git/ (and anything else in the repo not meant to be public) is never
+inside nginx's web root — important since nginx doesn't block dotfiles
+by default.
+
+Git auth is SSH, using root's SSH key (the tool is always run with sudo,
+so root is who actually runs git). Add the deploy key to
+/root/.ssh/ and register its public half as a read-only Deploy key on the
+GitHub repo. To avoid hanging on the first connection's host-key prompt,
+git commands run with GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new".
 
 Usage:
-    site_build.py <name> [--domain DOMAIN]
+    site_build.py create <name> [--domain DOMAIN] [--git URL] [--branch BRANCH]
+    site_build.py list
+    site_build.py status [name]
+    site_build.py enable <name>
+    site_build.py disable <name>
+    site_build.py remove <name> [--keep-files] [--yes]
+    site_build.py update <name>
 
-Example:
-    site_build.py messiah --domain messiah.example.org
-        -> validates everything first
-        -> creates /srv/www/messiah
-        -> writes /etc/nginx/sites-available/messiah
-        -> symlinks it into /etc/nginx/sites-enabled/messiah
-        -> tests nginx config, reloads nginx if valid
-        -> verifies the site is actually reachable
+Examples:
+    site_build.py create messiah --domain messiah.example.org
+        -> preflight checks, then creates /srv/www/messiah with a
+           placeholder index.html, nginx config, enables + tests +
+           reloads nginx, verifies it's reachable
 
-    site_build.py messiah
-        -> same, but domain defaults to "messiah"
+    site_build.py create messiah --domain messiah.example.org \\
+        --git git@github.com:parish/messiah-site.git --branch main
+        -> same, but clones the repo into /srv/www/messiah/repo and
+           points nginx at /srv/www/messiah/repo/public
+
+    site_build.py update messiah
+        -> git fetch origin && git reset --hard origin/main && git clean -fd
+           in /srv/www/messiah/repo (static files update immediately,
+           no nginx reload needed)
+
+    site_build.py list      -> table of every site: name, domain, enabled, git
+    site_build.py status              -> table of every site with live HTTP + git status
+    site_build.py status messiah      -> detailed status for just this one site
+    site_build.py disable messiah     -> removes the nginx symlink, reloads
+    site_build.py enable messiah      -> re-adds it, tests, reloads
+    site_build.py remove messiah      -> removes config + symlink + site dir
+                                          (asks for confirmation first)
 """
 
 import argparse
 import http.client
+import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 WEB_ROOT_BASE = Path("/srv/www")
@@ -55,6 +86,9 @@ DOMAIN_PATTERN = re.compile(
     r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
     r"(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$"
 )
+
+# Loose check: just enough to catch typos, not a full URL grammar.
+GIT_URL_PATTERN = re.compile(r"^(https?://|git@|ssh://)\S+$")
 
 NGINX_TEMPLATE = """server {{
     listen 80;
@@ -80,22 +114,93 @@ PLACEHOLDER_INDEX = """<!DOCTYPE html>
 </html>
 """
 
+METADATA_FILENAME = ".parish-site.json"
+
+
+# =====================================================================
+# Site metadata model
+# =====================================================================
+
+@dataclass(frozen=True)
+class SiteMetadata:
+    name: str
+    domain: str
+    git_repo: str | None = None
+    git_branch: str | None = None
+
+    @property
+    def site_dir(self) -> Path:
+        return WEB_ROOT_BASE / self.name
+
+    @property
+    def repo_dir(self) -> Path:
+        return self.site_dir / "repo"
+
+    @property
+    def public_dir(self) -> Path:
+        return self.repo_dir / "public"
+
+    @property
+    def metadata_path(self) -> Path:
+        return self.site_dir / METADATA_FILENAME
+
+    @property
+    def nginx_root(self) -> Path:
+        """Where nginx should actually serve from."""
+        return self.public_dir if self.git_repo else self.site_dir
+
+    def to_dict(self) -> dict:
+        d = {"name": self.name, "domain": self.domain}
+        if self.git_repo:
+            d["git"] = {"repo": self.git_repo, "branch": self.git_branch or "main"}
+        return d
+
+    @staticmethod
+    def from_dict(d: dict) -> "SiteMetadata":
+        git = d.get("git")
+        if git:
+            return SiteMetadata(
+                name=d["name"], domain=d["domain"],
+                git_repo=git.get("repo"), git_branch=git.get("branch") or "main",
+            )
+        return SiteMetadata(name=d["name"], domain=d["domain"])
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="site_build.py",
         description="Parish Site Builder — create and manage parish website directories and nginx configs.",
     )
-    parser.add_argument(
-        "name",
-        help="Site name, e.g. 'messiah'. Used as the directory name under /srv/www "
-             "and as the nginx config filename.",
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    create_p = subparsers.add_parser("create", help="Create a new site")
+    create_p.add_argument("name", help="Site name, used as the directory and nginx config filename.")
+    create_p.add_argument("--domain", help="Domain for the nginx server_name. Defaults to the site name.")
+    create_p.add_argument("--git", dest="git_repo", help="Git repo SSH URL, e.g. git@github.com:ORG/REPO.git")
+    create_p.add_argument("--branch", dest="git_branch", default="main", help="Git branch to deploy (default: main)")
+
+    subparsers.add_parser("list", help="List all sites")
+
+    status_p = subparsers.add_parser("status", help="Show status for one site, or all sites if omitted")
+    status_p.add_argument("name", nargs="?", help="Site name. Omit to show every site.")
+
+    enable_p = subparsers.add_parser("enable", help="Enable a disabled site")
+    enable_p.add_argument("name")
+
+    disable_p = subparsers.add_parser("disable", help="Disable a site without deleting it")
+    disable_p.add_argument("name")
+
+    remove_p = subparsers.add_parser("remove", help="Remove a site entirely")
+    remove_p.add_argument("name")
+    remove_p.add_argument(
+        "--keep-files", action="store_true",
+        help="Keep the site directory on disk; only remove the nginx config.",
     )
-    parser.add_argument(
-        "--domain",
-        help="Domain for the nginx server_name, e.g. 'messiah.example.org'. "
-             "Defaults to the site name if omitted.",
-    )
+    remove_p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
+
+    update_p = subparsers.add_parser("update", help="Pull the latest version from the linked git repo")
+    update_p.add_argument("name")
+
     return parser
 
 
@@ -109,6 +214,10 @@ def is_valid_site_name(name: str) -> bool:
 
 def is_valid_domain(domain: str) -> bool:
     return bool(DOMAIN_PATTERN.match(domain)) and len(domain) <= 253
+
+
+def is_valid_git_url(url: str) -> bool:
+    return bool(GIT_URL_PATTERN.match(url))
 
 
 def nginx_installed() -> bool:
@@ -130,9 +239,6 @@ def find_domain_conflict(domain: str) -> str | None:
     Scan existing nginx site configs for one that already claims this exact
     domain as a server_name. Returns the conflicting site's filename, or
     None if the domain is free.
-
-    This catches the case our other checks miss: two different site *names*
-    (e.g. "messiah" and "messiah2") both trying to claim the same domain.
     """
     if not NGINX_SITES_AVAILABLE.exists():
         return None
@@ -153,32 +259,67 @@ def find_domain_conflict(domain: str) -> str | None:
     return None
 
 
-def run_preflight_checks(name: str, domain: str) -> list[dict]:
+def extract_domain(config_path: Path) -> str | None:
+    """Pull the first server_name out of an nginx config file (fallback for
+    sites that predate the metadata file)."""
+    try:
+        text = config_path.read_text()
+    except OSError:
+        return None
+    match = re.search(r"server_name\s+([^;]+);", text)
+    return match.group(1).split()[0] if match else None
+
+
+def redact_url(url: str) -> str:
+    """
+    Mask embedded credentials before printing a URL. SSH URLs
+    (git@host:org/repo.git) never carry secrets in the URL itself — the key
+    is a file on disk — but this is kept as defense in depth in case an
+    https://user:pass@... URL is ever used instead.
+    """
+    return re.sub(r"://[^@/\s]+@", "://***@", url)
+
+
+def run_preflight_checks(meta: SiteMetadata) -> list[dict]:
     """
     Run every check before anything is created or changed.
-
     Returns a list of dicts: {"label": str, "passed": bool, "detail": str}.
-    `detail` may be populated on a pass too (e.g. showing the nginx binary
-    path), not just on failure.
     """
     checks = []
 
     checks.append({
         "label": "Valid site name",
-        "passed": is_valid_site_name(name),
-        "detail": "" if is_valid_site_name(name) else (
-            f"'{name}' must start with a letter/number and contain only letters, "
+        "passed": is_valid_site_name(meta.name),
+        "detail": "" if is_valid_site_name(meta.name) else (
+            f"'{meta.name}' must start with a letter/number and contain only letters, "
             "numbers, hyphens, and underscores (max 63 characters)."
         ),
     })
 
     checks.append({
         "label": "Valid domain",
-        "passed": is_valid_domain(domain),
-        "detail": "" if is_valid_domain(domain) else (
-            f"'{domain}' doesn't look like a valid domain/hostname."
+        "passed": is_valid_domain(meta.domain),
+        "detail": "" if is_valid_domain(meta.domain) else (
+            f"'{meta.domain}' doesn't look like a valid domain/hostname."
         ),
     })
+
+    if meta.git_repo:
+        valid_git = is_valid_git_url(meta.git_repo)
+        checks.append({
+            "label": "Valid git URL",
+            "passed": valid_git,
+            "detail": "" if valid_git else (
+                f"'{redact_url(meta.git_repo)}' doesn't look like a git URL "
+                "(expected it to start with https://, git@, or ssh://)."
+            ),
+        })
+        git_path = shutil.which("git")
+        checks.append({
+            "label": "git installed",
+            "passed": git_path is not None,
+            "detail": git_path if git_path else "git is not installed on this system.",
+        })
 
     nginx_path = shutil.which("nginx")
     installed = nginx_path is not None
@@ -198,32 +339,30 @@ def run_preflight_checks(name: str, domain: str) -> list[dict]:
             ),
         })
     else:
-        # Don't bother checking if it's running when it isn't even installed.
         checks.append({"label": "nginx running", "passed": False, "detail": "nginx is not installed."})
 
-    site_dir = WEB_ROOT_BASE / name
-    web_exists = site_dir.exists()
+    web_exists = meta.site_dir.exists()
     checks.append({
         "label": "Site directory available",
         "passed": not web_exists,
-        "detail": "" if not web_exists else f"{site_dir} already exists.",
+        "detail": "" if not web_exists else f"{meta.site_dir} already exists.",
     })
 
-    config_path = NGINX_SITES_AVAILABLE / name
-    symlink_path = NGINX_SITES_ENABLED / name
+    config_path = NGINX_SITES_AVAILABLE / meta.name
+    symlink_path = NGINX_SITES_ENABLED / meta.name
     config_exists = config_path.exists() or symlink_path.exists()
     checks.append({
         "label": "Nginx configuration available",
         "passed": not config_exists,
-        "detail": "" if not config_exists else f"An nginx config for '{name}' already exists.",
+        "detail": "" if not config_exists else f"An nginx config for '{meta.name}' already exists.",
     })
 
-    conflict = find_domain_conflict(domain)
+    conflict = find_domain_conflict(meta.domain)
     checks.append({
         "label": "Domain not already in use",
         "passed": conflict is None,
         "detail": "" if conflict is None else (
-            f"Domain '{domain}' is already used by site config '{conflict}'."
+            f"Domain '{meta.domain}' is already used by site config '{conflict}'."
         ),
     })
 
@@ -251,15 +390,85 @@ def print_preflight_results(checks: list[dict]) -> bool:
 
 
 # =====================================================================
-# Site creation — each function does one thing and reports exactly what
-# it did (or didn't) do, with full paths.
+# Git helpers (SSH, using root's key)
+# =====================================================================
+
+def git_env_for_ssh() -> dict:
+    """
+    Make git-over-SSH non-interactive on first connection by accepting new
+    host keys automatically, instead of hanging on:
+      "Are you sure you want to continue connecting (yes/no)?"
+    """
+    env = dict(os.environ)
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o StrictHostKeyChecking=accept-new")
+    return env
+
+
+def run_git(args: list[str], cwd: Path | None = None) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            ["git"] + args,
+            cwd=str(cwd) if cwd else None,
+            env=git_env_for_ssh(),
+            capture_output=True, text=True, check=False,
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        return result.returncode == 0, output
+    except FileNotFoundError:
+        return False, "git command not found"
+
+
+def clone_repo(meta: SiteMetadata) -> tuple[bool, str]:
+    """Clone meta.git_repo (at meta.git_branch) into meta.repo_dir."""
+    branch = meta.git_branch or "main"
+    return run_git(["clone", "--branch", branch, meta.git_repo, str(meta.repo_dir)])
+
+
+def write_metadata(meta: SiteMetadata) -> tuple[int, Path | None]:
+    try:
+        meta.metadata_path.write_text(json.dumps(meta.to_dict(), indent=2, sort_keys=True) + "\n")
+    except PermissionError:
+        print(f"  [FAIL] Write metadata: permission denied writing {meta.metadata_path} (try sudo)")
+        return 1, None
+    except OSError as e:
+        print(f"  [FAIL] Write metadata: {meta.metadata_path}: {e}")
+        return 1, None
+    print(f"  [OK] Wrote metadata: {meta.metadata_path}")
+    return 0, meta.metadata_path
+
+
+def try_read_metadata(name: str) -> SiteMetadata | None:
+    """Silent variant for list/status scans — returns None on any problem."""
+    path = WEB_ROOT_BASE / name / METADATA_FILENAME
+    try:
+        return SiteMetadata.from_dict(json.loads(path.read_text()))
+    except (OSError, json.JSONDecodeError, KeyError):
+        return None
+
+
+def read_metadata_for_site(name: str) -> tuple[int, SiteMetadata | None]:
+    """Noisy variant for commands (like update) where a missing/bad
+    metadata file is itself the thing that should fail the operation."""
+    path = WEB_ROOT_BASE / name / METADATA_FILENAME
+    if not path.exists():
+        print(f"[FAIL] No metadata found at {path} (site not created with this version?)")
+        return 1, None
+    try:
+        return 0, SiteMetadata.from_dict(json.loads(path.read_text()))
+    except OSError as e:
+        print(f"[FAIL] Read metadata: {path}: {e}")
+        return 1, None
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"[FAIL] Read metadata: {path}: invalid content ({e})")
+        return 1, None
+
+
+# =====================================================================
+# Site creation building blocks
 # =====================================================================
 
 def create_web_root(name: str) -> tuple[int, Path | None]:
-    """
-    Create /srv/www/<name>.
-    Returns (exit_code, path_or_None).
-    """
+    """Create /srv/www/<name>. Returns (exit_code, path_or_None)."""
     site_path = WEB_ROOT_BASE / name
 
     if site_path.exists():
@@ -282,21 +491,17 @@ def create_web_root(name: str) -> tuple[int, Path | None]:
         print(f"  [FAIL] Create directory: {site_path}: {e}")
         return 1, None
 
-    # TODO(v0.4+): set ownership to www-data:www-data.
+    # TODO: set ownership to www-data:www-data.
     print(f"  [OK] Created directory: {site_path}")
     return 0, site_path
 
 
-def write_placeholder_index(name: str, domain: str) -> Path | None:
-    """
-    Best-effort: drop a placeholder index.html so the site isn't a bare 404.
-    Not fatal if this fails — the site still works, it'll just 404 until
-    real content is added.
-    Returns the path on success, None on failure.
-    """
-    index_path = WEB_ROOT_BASE / name / "index.html"
+def write_placeholder_index(meta: SiteMetadata) -> Path | None:
+    """Best-effort: drop a placeholder index.html for non-git sites so
+    they're not a bare 404. Not fatal if this fails."""
+    index_path = meta.site_dir / "index.html"
     try:
-        index_path.write_text(PLACEHOLDER_INDEX.format(domain=domain))
+        index_path.write_text(PLACEHOLDER_INDEX.format(domain=meta.domain))
         print(f"  [OK] Created index: {index_path}")
         return index_path
     except OSError as e:
@@ -304,19 +509,15 @@ def write_placeholder_index(name: str, domain: str) -> Path | None:
         return None
 
 
-def write_nginx_config(name: str, domain: str) -> tuple[int, Path | None]:
-    """
-    Write /etc/nginx/sites-available/<name> from the template.
-    Returns (exit_code, path_or_None).
-    """
-    config_path = NGINX_SITES_AVAILABLE / name
-    web_root = WEB_ROOT_BASE / name
+def write_nginx_config(meta: SiteMetadata) -> tuple[int, Path | None]:
+    """Write /etc/nginx/sites-available/<name>, rooted at meta.nginx_root."""
+    config_path = NGINX_SITES_AVAILABLE / meta.name
 
     if config_path.exists():
         print(f"  [FAIL] Create Nginx config: {config_path} already exists")
         return 1, None
 
-    config_text = NGINX_TEMPLATE.format(domain=domain, web_root=web_root)
+    config_text = NGINX_TEMPLATE.format(domain=meta.domain, web_root=meta.nginx_root)
     try:
         config_path.write_text(config_text)
     except PermissionError:
@@ -331,11 +532,7 @@ def write_nginx_config(name: str, domain: str) -> tuple[int, Path | None]:
 
 
 def enable_site(name: str, config_path: Path) -> tuple[int, Path | None]:
-    """
-    Symlink /etc/nginx/sites-enabled/<name> -> config_path.
-    Returns (exit_code, symlink_path_or_None). Does NOT roll back
-    config_path on failure — the caller decides what to do with that.
-    """
+    """Symlink /etc/nginx/sites-enabled/<name> -> config_path."""
     symlink_path = NGINX_SITES_ENABLED / name
 
     if symlink_path.exists():
@@ -353,11 +550,8 @@ def enable_site(name: str, config_path: Path) -> tuple[int, Path | None]:
 
 
 def test_nginx_config() -> tuple[bool, str]:
-    """Run `nginx -t`. Returns (success, output)."""
     try:
-        result = subprocess.run(
-            ["nginx", "-t"], capture_output=True, text=True, check=False
-        )
+        result = subprocess.run(["nginx", "-t"], capture_output=True, text=True, check=False)
         output = (result.stdout or "") + (result.stderr or "")
         return result.returncode == 0, output
     except FileNotFoundError:
@@ -365,7 +559,6 @@ def test_nginx_config() -> tuple[bool, str]:
 
 
 def reload_nginx() -> tuple[bool, str]:
-    """Run `systemctl reload nginx`. Returns (success, output)."""
     try:
         result = subprocess.run(
             ["systemctl", "reload", "nginx"], capture_output=True, text=True, check=False
@@ -377,7 +570,6 @@ def reload_nginx() -> tuple[bool, str]:
 
 
 def restart_nginx() -> tuple[bool, str]:
-    """Run `systemctl restart nginx`. Returns (success, output)."""
     try:
         result = subprocess.run(
             ["systemctl", "restart", "nginx"], capture_output=True, text=True, check=False
@@ -389,11 +581,7 @@ def restart_nginx() -> tuple[bool, str]:
 
 
 def validate_and_reload(config_path: Path, symlink_path: Path) -> int:
-    """
-    Section: "Validating Nginx configuration:" — run `nginx -t`, and if it
-    passes, reload nginx. Rolls back (removes config_path and symlink_path)
-    if the test fails, so a bad config never reaches the running nginx.
-    """
+    """Run `nginx -t`; reload if it passes; roll back config+symlink if not."""
     print("Validating Nginx configuration:")
 
     ok, output = test_nginx_config()
@@ -434,12 +622,6 @@ def verify_site_serving(domain: str) -> list[str]:
     """
     Probe the site over both IPv4 and IPv6 loopback with the right Host
     header, and check whether nginx is actually routing to it.
-
-    `reload` re-reads config files but doesn't reliably rebind newly added
-    listen sockets, so a config that tests clean and reloads without error
-    can still silently fall through to the default site. This catches that.
-
-    Returns a list of human-readable problems. Empty list = looks fine.
     """
     problems = []
     for family_name, host in [("IPv4", "127.0.0.1"), ("IPv6", "::1")]:
@@ -461,12 +643,7 @@ def verify_site_serving(domain: str) -> list[str]:
 
 
 def verify_and_maybe_restart(domain: str) -> int:
-    """
-    Section: "Verifying site:" — check the site is actually reachable, and
-    if not, explain why and offer to restart nginx. Never rolls back — the
-    config is valid and enabled either way, this only affects whether the
-    running nginx process has picked it up yet.
-    """
+    """Check the site is reachable; offer to restart nginx if not."""
     print("Verifying site:")
 
     problems = verify_site_serving(domain)
@@ -510,20 +687,25 @@ def verify_and_maybe_restart(domain: str) -> int:
 
 
 # =====================================================================
-# Orchestration
+# Subcommand handlers
 # =====================================================================
 
-def main(argv=None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+def cmd_create(args) -> int:
     name = args.name
     domain = args.domain or args.name
+    meta = SiteMetadata(
+        name=name, domain=domain,
+        git_repo=args.git_repo,
+        git_branch=args.git_branch if args.git_repo else None,
+    )
 
-    print(f"Site:   {name}")
-    print(f"Domain: {domain}")
+    print(f"Site:   {meta.name}")
+    print(f"Domain: {meta.domain}")
+    if meta.git_repo:
+        print(f"Git:    {redact_url(meta.git_repo)} ({meta.git_branch})")
     print()
 
-    checks = run_preflight_checks(name, domain)
+    checks = run_preflight_checks(meta)
     if not print_preflight_results(checks):
         return 1
     print()
@@ -531,25 +713,48 @@ def main(argv=None) -> int:
     created: list[Path] = []
 
     print("Creating site:")
-    rc, web_root_path = create_web_root(name)
+    rc, site_dir = create_web_root(name)
     if rc != 0:
         return rc
-    created.append(web_root_path)
+    created.append(site_dir)
 
-    index_path = write_placeholder_index(name, domain)
-    if index_path is not None:
-        created.append(index_path)
-
-    rc, config_path = write_nginx_config(name, domain)
+    rc, meta_path = write_metadata(meta)
     if rc != 0:
+        shutil.rmtree(site_dir, ignore_errors=True)
+        print(f"  Rolled back: removed {site_dir}")
+        return rc
+    created.append(meta_path)
+
+    if meta.git_repo:
+        ok, output = clone_repo(meta)
+        if not ok:
+            print(f"  [FAIL] Clone git repo: {redact_url(meta.git_repo)}")
+            for line in output.strip().splitlines():
+                print(f"         {line}")
+            shutil.rmtree(site_dir, ignore_errors=True)
+            print()
+            print(f"  Rolled back: removed {site_dir}")
+            print("  No changes were made to nginx.")
+            return 1
+        print(f"  [OK] Cloned git repo: {redact_url(meta.git_repo)} -> {meta.repo_dir}")
+        created.append(meta.repo_dir)
+    else:
+        index_path = write_placeholder_index(meta)
+        if index_path is not None:
+            created.append(index_path)
+
+    rc, config_path = write_nginx_config(meta)
+    if rc != 0:
+        shutil.rmtree(site_dir, ignore_errors=True)
+        print(f"  Rolled back: removed {site_dir}")
         return rc
     created.append(config_path)
 
     rc, symlink_path = enable_site(name, config_path)
     if rc != 0:
-        # config_path was written but never enabled — clean it up too,
-        # since nothing was ever tested or reloaded with it in place.
         config_path.unlink(missing_ok=True)
+        shutil.rmtree(site_dir, ignore_errors=True)
+        print(f"  Rolled back: removed {config_path} and {site_dir}")
         return rc
     created.append(symlink_path)
     print()
@@ -559,19 +764,272 @@ def main(argv=None) -> int:
         return rc
     print()
 
-    verify_and_maybe_restart(domain)
+    verify_and_maybe_restart(meta.domain)
     print()
 
     print("Site created successfully.")
     print()
-    print(f"Site:   {name}")
-    print(f"Domain: {domain}")
+    print(f"Site:   {meta.name}")
+    print(f"Domain: {meta.domain}")
+    if meta.git_repo:
+        print(f"Git:    {redact_url(meta.git_repo)} ({meta.git_branch})")
     print()
     print("Created:")
     for path in created:
         print(f"  {path}")
+    if meta.git_repo:
+        print()
+        print(f"Update this site later with: sudo python3 site_build.py update {name}")
 
     return 0
+
+
+def cmd_list(args) -> int:
+    if not NGINX_SITES_AVAILABLE.exists():
+        print("No sites found.")
+        return 0
+
+    site_names = sorted(
+        p.name for p in NGINX_SITES_AVAILABLE.iterdir()
+        if p.is_file() and p.name != "default"
+    )
+    if not site_names:
+        print("No sites found.")
+        return 0
+
+    print(f"{'SITE':<20}{'DOMAIN':<30}{'ENABLED':<10}{'GIT'}")
+    for name in site_names:
+        meta = try_read_metadata(name)
+        domain = meta.domain if meta else (extract_domain(NGINX_SITES_AVAILABLE / name) or "?")
+        enabled = "yes" if (NGINX_SITES_ENABLED / name).exists() else "no"
+        git_linked = "yes" if meta and meta.git_repo else "no"
+        print(f"{name:<20}{domain:<30}{enabled:<10}{git_linked}")
+    return 0
+
+
+def cmd_status(args) -> int:
+    if args.name:
+        return _status_single(args.name)
+    return _status_all()
+
+
+def _status_single(name: str) -> int:
+    config_path = NGINX_SITES_AVAILABLE / name
+    if not config_path.exists():
+        print(f"No such site: {name}")
+        return 1
+
+    meta = try_read_metadata(name)
+    domain = meta.domain if meta else (extract_domain(config_path) or name)
+    enabled = (NGINX_SITES_ENABLED / name).exists()
+
+    print(f"Site:    {name}")
+    print(f"Domain:  {domain}")
+    print(f"Enabled: {'yes' if enabled else 'no'}")
+
+    if enabled:
+        problems = verify_site_serving(domain)
+        print(f"HTTP:    {'OK' if not problems else 'FAIL - ' + '; '.join(problems)}")
+    else:
+        print("HTTP:    not checked (site is disabled)")
+
+    if meta and meta.git_repo:
+        ok, commit = run_git(["rev-parse", "--short", "HEAD"], cwd=meta.repo_dir)
+        commit_display = commit.strip() if ok else "unknown"
+        print(f"Git:     {redact_url(meta.git_repo)} ({meta.git_branch}) @ {commit_display}")
+    else:
+        print("Git:     not linked")
+
+    return 0
+
+
+def _status_all() -> int:
+    if not NGINX_SITES_AVAILABLE.exists():
+        print("No sites found.")
+        return 0
+
+    site_names = sorted(
+        p.name for p in NGINX_SITES_AVAILABLE.iterdir()
+        if p.is_file() and p.name != "default"
+    )
+    if not site_names:
+        print("No sites found.")
+        return 0
+
+    print(f"{'SITE':<20}{'HTTP':<8}{'GIT'}")
+    for name in site_names:
+        meta = try_read_metadata(name)
+        domain = meta.domain if meta else (extract_domain(NGINX_SITES_AVAILABLE / name) or name)
+        enabled = (NGINX_SITES_ENABLED / name).exists()
+        if enabled:
+            problems = verify_site_serving(domain)
+            http_status = "OK" if not problems else "FAIL"
+        else:
+            http_status = "off"
+        git_display = "linked" if meta and meta.git_repo else "-"
+        print(f"{name:<20}{http_status:<8}{git_display}")
+    return 0
+
+
+def cmd_enable(args) -> int:
+    name = args.name
+    config_path = NGINX_SITES_AVAILABLE / name
+    if not config_path.exists():
+        print(f"[FAIL] No such site: {name}")
+        return 1
+
+    symlink_path = NGINX_SITES_ENABLED / name
+    if symlink_path.exists():
+        print(f"[OK] {name} is already enabled")
+        return 0
+
+    rc, symlink_path = enable_site(name, config_path)
+    if rc != 0:
+        return rc
+
+    return validate_and_reload(config_path, symlink_path)
+
+
+def cmd_disable(args) -> int:
+    name = args.name
+    symlink_path = NGINX_SITES_ENABLED / name
+
+    if not symlink_path.exists():
+        print(f"[OK] {name} is already disabled")
+        return 0
+
+    symlink_path.unlink()
+    print(f"[OK] Disabled: removed {symlink_path}")
+
+    ok, output = reload_nginx()
+    if not ok:
+        print("[FAIL] Reload nginx")
+        for line in output.strip().splitlines():
+            print(f"       {line}")
+        return 1
+    print("[OK] Reloaded nginx")
+    return 0
+
+
+def cmd_remove(args) -> int:
+    name = args.name
+    config_path = NGINX_SITES_AVAILABLE / name
+    symlink_path = NGINX_SITES_ENABLED / name
+    site_dir = WEB_ROOT_BASE / name
+
+    if not config_path.exists() and not site_dir.exists():
+        print(f"No such site: {name}")
+        return 1
+
+    print("This will remove:")
+    if symlink_path.exists():
+        print(f"  {symlink_path}")
+    if config_path.exists():
+        print(f"  {config_path}")
+    if not args.keep_files and site_dir.exists():
+        print(f"  {site_dir} (and all its contents)")
+
+    if not args.yes:
+        if not prompt_yes_no("Are you sure?"):
+            print("Cancelled. No changes were made.")
+            return 1
+
+    if symlink_path.exists():
+        symlink_path.unlink()
+        print(f"[OK] Removed {symlink_path}")
+    if config_path.exists():
+        config_path.unlink()
+        print(f"[OK] Removed {config_path}")
+    if not args.keep_files and site_dir.exists():
+        shutil.rmtree(site_dir)
+        print(f"[OK] Removed {site_dir}")
+
+    ok, output = reload_nginx()
+    if ok:
+        print("[OK] Reloaded nginx")
+    else:
+        print("[WARN] nginx reload failed — run 'sudo systemctl reload nginx' manually")
+        for line in output.strip().splitlines():
+            print(f"       {line}")
+
+    return 0
+
+
+def cmd_update(args) -> int:
+    name = args.name
+
+    rc, meta = read_metadata_for_site(name)
+    if rc != 0 or meta is None:
+        return 1
+
+    if not meta.git_repo:
+        print(f"[FAIL] '{name}' is not linked to a git repository.")
+        print(f"       Recreate it with --git <repo-url> to link one.")
+        return 1
+
+    if not (meta.repo_dir / ".git").exists():
+        print(f"[FAIL] {meta.repo_dir} is not a git repository (missing .git).")
+        return 1
+
+    print("Updating from git:")
+
+    ok, output = run_git(["fetch", "origin"], cwd=meta.repo_dir)
+    if not ok:
+        print("  [FAIL] git fetch origin")
+        for line in output.strip().splitlines():
+            print(f"         {line}")
+        return 1
+    print("  [OK] git fetch origin")
+
+    branch = meta.git_branch or "main"
+    ok, output = run_git(["reset", "--hard", f"origin/{branch}"], cwd=meta.repo_dir)
+    if not ok:
+        print(f"  [FAIL] git reset --hard origin/{branch}")
+        for line in output.strip().splitlines():
+            print(f"         {line}")
+        return 1
+    print(f"  [OK] git reset --hard origin/{branch}")
+
+    ok, output = run_git(["clean", "-fd"], cwd=meta.repo_dir)
+    if not ok:
+        print("  [FAIL] git clean -fd")
+        for line in output.strip().splitlines():
+            print(f"         {line}")
+        return 1
+    print("  [OK] git clean -fd")
+
+    ok, commit_out = run_git(["rev-parse", "--short", "HEAD"], cwd=meta.repo_dir)
+    if ok:
+        print(f"  Now at commit: {commit_out.strip()}")
+
+    print()
+    print(f"Updated: {name} from {redact_url(meta.git_repo)} ({branch})")
+    print("(Static files update immediately — no nginx reload needed.)")
+
+    print()
+    verify_and_maybe_restart(meta.domain)
+
+    return 0
+
+
+# =====================================================================
+# Orchestration
+# =====================================================================
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    handlers = {
+        "create": cmd_create,
+        "list": cmd_list,
+        "status": cmd_status,
+        "enable": cmd_enable,
+        "disable": cmd_disable,
+        "remove": cmd_remove,
+        "update": cmd_update,
+    }
+    return handlers[args.command](args)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 # parish-site-builder
 
 A tool for creating and managing small parish websites, built up one
-feature at a time. Currently at **v0.4**.
+feature at a time. Currently at **v0.5**.
 
 ## Quick start
 

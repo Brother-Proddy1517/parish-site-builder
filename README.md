@@ -1,7 +1,7 @@
 # parish-site-builder
 
 A tool for creating and managing small parish websites, built up one
-feature at a time. Currently at **v0.5**.
+feature at a time. Currently at **v0.4**.
 
 ## Quick start
 
@@ -13,6 +13,17 @@ sudo python3 site_build.py list
 sudo python3 site_build.py status
 sudo python3 site_build.py update messiah
 ```
+
+### Install as a regular command (optional)
+
+```bash
+sudo ./install.sh
+sudo site-build list
+```
+
+This symlinks `site_build.py` to `/usr/local/bin/site-build`, so you can
+run `sudo site-build ...` instead of `sudo python3 site_build.py ...`.
+It's a symlink, not a copy, so `git pull` keeps it current automatically.
 
 For the full command reference, see [`MANUAL.md`](MANUAL.md) — a man-page
 style document covering every command, every safety guarantee, the
@@ -44,6 +55,7 @@ doesn't require nginx or git to actually be installed.
 - [x] v0.3.1 — explicit, path-by-path CLI output for checks and changes
 - [x] v0.4 — subcommands (create/list/status/enable/disable/remove/update) + SSH-based git deployment
 - [x] v0.5 — SSL via Let's Encrypt (certbot certonly --webroot), enable-ssl command, cert expiry in `status`
+- [x] v0.5.1 — `doctor` command (whole-machine readiness check) + `install.sh` for a `site-build` shortcut
 
 ## Testing workflow
 

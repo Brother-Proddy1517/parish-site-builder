@@ -16,6 +16,7 @@ site_build.py disable <name>
 site_build.py remove <name> [--keep-files] [--yes]
 site_build.py update <name>
 site_build.py enable-ssl <name> --email EMAIL
+site_build.py doctor
 ```
 
 Every command that changes the filesystem or nginx config must be run as
@@ -342,7 +343,7 @@ a free service like `sslip.io` (`<your-vps-ip>.sslip.io` resolves
 automatically to that IP) works well and exercises the exact same flow a
 real parish domain would.
 
-
+## PRE-FLIGHT CHECKS
 
 `create` runs every one of these before making any change. Printed as:
 
@@ -374,6 +375,45 @@ Preflight checks:
 | Site directory available | `/srv/www/<name>` already exists |
 | Nginx configuration available | A config or enabled symlink for `<name>` already exists |
 | Domain not already in use | A **different** site's config already claims this exact domain as `server_name` |
+
+## `doctor`
+
+Checks that the whole machine is ready to host sites — not tied to any
+one site. Useful right after setting up a fresh VPS, before you ever run
+`create`.
+
+```
+System check:
+  [PASS] Running as root
+  [PASS] nginx installed: /usr/sbin/nginx
+  [PASS] nginx running
+  [PASS] nginx enabled on boot
+  [PASS] git installed: /usr/bin/git
+  [PASS] openssl installed: /usr/bin/openssl
+  [PASS] certbot installed: /usr/bin/certbot
+  [PASS] certbot renewal timer active
+  [PASS] /srv/www exists
+  [PASS] /etc/nginx/sites-available exists
+  [PASS] /etc/nginx/sites-enabled exists
+  [PASS] nginx listening on port 80 (local check)
+  [PASS] nginx listening on port 443 (local check)
+  [WARN] ufw allows port 443: Run: sudo ufw allow 443/tcp
+
+System looks ready. (WARNs are advisory, not blocking.)
+```
+
+Unlike pre-flight checks, `doctor` never changes anything — it only
+reports. Checks are `PASS`, `WARN`, or `FAIL`: a missing *required* piece
+(nginx, `/srv/www`, root privileges) is `FAIL`; a missing *optional*
+piece (`git`, `certbot` — only needed if you're using those features) is
+`WARN`. Only `FAIL`s affect the exit code.
+
+The port-listening check only confirms nginx is bound **locally** — it
+cannot confirm the port is reachable from the internet (that depends on
+your VPS provider's network-level firewall/security groups, which this
+tool has no visibility into). If `ufw` isn't installed, its checks are
+skipped silently rather than reported as failures — many VPS providers
+firewall at the network level instead of locally.
 
 If any check fails, the full list is printed with `[FAIL]` and a specific
 reason, followed by `No changes were made.` — and the command exits

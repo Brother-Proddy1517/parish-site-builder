@@ -1001,3 +1001,86 @@ def test_status_single_shows_no_cert_when_http_only(fake_ssl_dirs, monkeypatch, 
 
     assert exit_code == 0
     assert "none (HTTP only)" in out
+
+
+# =====================================================================
+# doctor
+# =====================================================================
+
+def test_doctor_fails_when_not_root(fake_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    monkeypatch.setattr(site_build, "nginx_is_running", lambda: True)
+    monkeypatch.setattr(site_build, "nginx_enabled_on_boot", lambda: True)
+    monkeypatch.setattr(site_build, "certbot_timer_active", lambda: True)
+    monkeypatch.setattr(site_build, "can_connect_localhost", lambda port: True)
+
+    exit_code = site_build.main(["doctor"])
+    assert exit_code != 0
+
+
+def test_doctor_fails_when_nginx_missing(fake_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: None)
+
+    exit_code = site_build.main(["doctor"])
+    assert exit_code != 0
+
+
+def test_doctor_passes_on_fully_ready_box(fake_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: (None if cmd == "ufw" else f"/usr/bin/{cmd}"))
+    monkeypatch.setattr(site_build, "nginx_is_running", lambda: True)
+    monkeypatch.setattr(site_build, "nginx_enabled_on_boot", lambda: True)
+    monkeypatch.setattr(site_build, "certbot_timer_active", lambda: True)
+    monkeypatch.setattr(site_build, "can_connect_localhost", lambda port: True)
+
+    exit_code = site_build.main(["doctor"])
+    assert exit_code == 0
+
+
+def test_doctor_missing_git_or_certbot_is_warn_not_fail(fake_dirs, monkeypatch):
+    """Optional tools missing shouldn't block doctor's overall pass."""
+    def which(cmd):
+        if cmd in ("git", "certbot", "ufw"):
+            return None
+        return f"/usr/bin/{cmd}"
+
+    monkeypatch.setattr(site_build.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(site_build.shutil, "which", which)
+    monkeypatch.setattr(site_build, "nginx_is_running", lambda: True)
+    monkeypatch.setattr(site_build, "nginx_enabled_on_boot", lambda: True)
+    monkeypatch.setattr(site_build, "can_connect_localhost", lambda port: True)
+
+    exit_code = site_build.main(["doctor"])
+    assert exit_code == 0  # WARNs don't block
+
+
+def test_doctor_ufw_blocking_port_is_warn_not_fail(fake_dirs, monkeypatch):
+    monkeypatch.setattr(site_build.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    monkeypatch.setattr(site_build, "nginx_is_running", lambda: True)
+    monkeypatch.setattr(site_build, "nginx_enabled_on_boot", lambda: True)
+    monkeypatch.setattr(site_build, "certbot_timer_active", lambda: True)
+    monkeypatch.setattr(site_build, "can_connect_localhost", lambda port: True)
+    monkeypatch.setattr(site_build, "ufw_status_output", lambda: "Status: active\n80/tcp ALLOW Anywhere\n")
+
+    exit_code = site_build.main(["doctor"])
+    assert exit_code == 0  # missing 443 rule is a WARN
+
+
+def test_doctor_output_lists_each_check(fake_dirs, monkeypatch, capsys):
+    monkeypatch.setattr(site_build.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(site_build.shutil, "which", lambda cmd: (None if cmd == "ufw" else f"/usr/bin/{cmd}"))
+    monkeypatch.setattr(site_build, "nginx_is_running", lambda: True)
+    monkeypatch.setattr(site_build, "nginx_enabled_on_boot", lambda: True)
+    monkeypatch.setattr(site_build, "certbot_timer_active", lambda: True)
+    monkeypatch.setattr(site_build, "can_connect_localhost", lambda port: True)
+
+    site_build.main(["doctor"])
+    out = capsys.readouterr().out
+
+    assert "System check:" in out
+    assert "nginx installed" in out
+    assert "certbot installed" in out
+    assert "git installed" in out

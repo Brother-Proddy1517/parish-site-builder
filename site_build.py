@@ -83,6 +83,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -260,6 +261,11 @@ def build_parser() -> argparse.ArgumentParser:
     enable_ssl_p = subparsers.add_parser("enable-ssl", help="Issue a Let's Encrypt certificate for an existing site")
     enable_ssl_p.add_argument("name")
     enable_ssl_p.add_argument("--email", required=True, help="Contact email for Let's Encrypt.")
+
+    subparsers.add_parser(
+        "doctor",
+        help="Check that this machine is ready to host sites (nginx, certbot, git, ports, firewall)",
+    )
 
     return parser
 
@@ -645,7 +651,11 @@ def create_web_root(name: str) -> tuple[int, Path | None]:
         print(f"  [FAIL] Create directory: {site_path}: {e}")
         return 1, None
 
-    # TODO: set ownership to www-data:www-data.
+    # Left root-owned deliberately, not a TODO: default umask (022) makes
+    # this world-readable (644)/traversable (755), which is all nginx's
+    # www-data worker needs to serve it — and the content is public web
+    # content anyway. Only revisit this if a future feature needs
+    # www-data to *write* into the site directory (uploads, caching, etc).
     print(f"  [OK] Created directory: {site_path}")
     return 0, site_path
 
@@ -1014,6 +1024,201 @@ def enable_ssl_for_site(meta: SiteMetadata, email: str) -> int:
         print(f"  Certificate valid for {days} days")
 
     return 0
+
+
+# =====================================================================
+# doctor — whole-machine readiness check (informative, nothing blocks)
+# =====================================================================
+
+def nginx_enabled_on_boot() -> bool:
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-enabled", "nginx"], capture_output=True, text=True, check=False
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def certbot_timer_active() -> bool:
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "certbot.timer"], capture_output=True, text=True, check=False
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def can_connect_localhost(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def ufw_status_output() -> str:
+    try:
+        result = subprocess.run(["ufw", "status"], capture_output=True, text=True, check=False)
+        return (result.stdout or "") + (result.stderr or "")
+    except FileNotFoundError:
+        return ""
+
+
+def ufw_allows_port(output: str, port: int) -> bool:
+    for line in output.splitlines():
+        if str(port) in line and "ALLOW" in line.upper():
+            return True
+    return False
+
+
+def run_doctor_checks() -> list[dict]:
+    """
+    Whole-machine readiness, not tied to any one site. Unlike preflight
+    checks, nothing here blocks anything — it's purely informative, run
+    any time (especially useful right after a fresh VPS setup, before
+    ever running `create`). Each check has a "status" of PASS, WARN, or
+    FAIL rather than a plain pass/fail: a missing optional tool (git,
+    certbot) is a WARN, not a FAIL, since not every site needs them.
+    """
+    checks = []
+
+    is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+    checks.append({
+        "label": "Running as root",
+        "status": "PASS" if is_root else "FAIL",
+        "detail": "" if is_root else "Most commands need root — run with sudo.",
+    })
+
+    nginx_path = shutil.which("nginx")
+    checks.append({
+        "label": "nginx installed",
+        "status": "PASS" if nginx_path else "FAIL",
+        "detail": nginx_path or "Install with: sudo apt install nginx",
+    })
+
+    running = False
+    if nginx_path:
+        running = nginx_is_running()
+        checks.append({
+            "label": "nginx running",
+            "status": "PASS" if running else "FAIL",
+            "detail": "" if running else "Start with: sudo systemctl start nginx",
+        })
+        enabled = nginx_enabled_on_boot()
+        checks.append({
+            "label": "nginx enabled on boot",
+            "status": "PASS" if enabled else "WARN",
+            "detail": "" if enabled else "Enable with: sudo systemctl enable nginx",
+        })
+    else:
+        checks.append({"label": "nginx running", "status": "FAIL", "detail": "nginx is not installed."})
+        checks.append({"label": "nginx enabled on boot", "status": "FAIL", "detail": "nginx is not installed."})
+
+    git_path = shutil.which("git")
+    checks.append({
+        "label": "git installed",
+        "status": "PASS" if git_path else "WARN",
+        "detail": git_path or "Only needed for --git / update. Install with: sudo apt install git",
+    })
+
+    openssl_path = shutil.which("openssl")
+    checks.append({
+        "label": "openssl installed",
+        "status": "PASS" if openssl_path else "WARN",
+        "detail": openssl_path or "Needed for cert expiry in `status`. Install with: sudo apt install openssl",
+    })
+
+    certbot_path = shutil.which("certbot")
+    checks.append({
+        "label": "certbot installed",
+        "status": "PASS" if certbot_path else "WARN",
+        "detail": certbot_path or "Only needed for --ssl / enable-ssl. Install with: sudo apt install certbot",
+    })
+    if certbot_path:
+        timer_active = certbot_timer_active()
+        checks.append({
+            "label": "certbot renewal timer active",
+            "status": "PASS" if timer_active else "WARN",
+            "detail": "" if timer_active else (
+                "Certs won't auto-renew. Check: sudo systemctl list-timers | grep certbot"
+            ),
+        })
+
+    web_root_exists = WEB_ROOT_BASE.exists()
+    checks.append({
+        "label": f"{WEB_ROOT_BASE} exists",
+        "status": "PASS" if web_root_exists else "FAIL",
+        "detail": "" if web_root_exists else f"Create it with: sudo mkdir -p {WEB_ROOT_BASE}",
+    })
+
+    sites_available_exists = NGINX_SITES_AVAILABLE.exists()
+    checks.append({
+        "label": f"{NGINX_SITES_AVAILABLE} exists",
+        "status": "PASS" if sites_available_exists else "FAIL",
+        "detail": "" if sites_available_exists else "nginx doesn't look properly installed.",
+    })
+
+    sites_enabled_exists = NGINX_SITES_ENABLED.exists()
+    checks.append({
+        "label": f"{NGINX_SITES_ENABLED} exists",
+        "status": "PASS" if sites_enabled_exists else "FAIL",
+        "detail": "" if sites_enabled_exists else "nginx doesn't look properly installed.",
+    })
+
+    if nginx_path and running:
+        for port in (80, 443):
+            reachable = can_connect_localhost(port)
+            checks.append({
+                "label": f"nginx listening on port {port} (local check)",
+                "status": "PASS" if reachable else "WARN",
+                "detail": "" if reachable else (
+                    f"Could not connect to 127.0.0.1:{port}. This only confirms nginx is "
+                    "bound locally — it doesn't confirm the port is reachable from the internet."
+                ),
+            })
+
+    ufw_path = shutil.which("ufw")
+    if ufw_path:
+        output = ufw_status_output()
+        for port in (80, 443):
+            allowed = ufw_allows_port(output, port)
+            checks.append({
+                "label": f"ufw allows port {port}",
+                "status": "PASS" if allowed else "WARN",
+                "detail": "" if allowed else f"Run: sudo ufw allow {port}/tcp",
+            })
+    # If ufw isn't installed, skip silently — some VPS providers firewall
+    # at the network/security-group level instead of locally.
+
+    return checks
+
+
+def print_doctor_results(checks: list[dict]) -> bool:
+    print("System check:")
+    has_fail = False
+    for check in checks:
+        line = f"  [{check['status']}] {check['label']}"
+        if check["detail"]:
+            line += f": {check['detail']}"
+        print(line)
+        if check["status"] == "FAIL":
+            has_fail = True
+
+    print()
+    if has_fail:
+        print("Some checks failed — fix these before creating sites.")
+    else:
+        print("System looks ready. (WARNs are advisory, not blocking.)")
+
+    return not has_fail
+
+
+def cmd_doctor(args) -> int:
+    checks = run_doctor_checks()
+    ok = print_doctor_results(checks)
+    return 0 if ok else 1
 
 
 # =====================================================================
@@ -1417,6 +1622,7 @@ def main(argv=None) -> int:
         "remove": cmd_remove,
         "update": cmd_update,
         "enable-ssl": cmd_enable_ssl,
+        "doctor": cmd_doctor,
     }
     return handlers[args.command](args)
 
